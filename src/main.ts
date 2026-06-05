@@ -1,0 +1,1618 @@
+import JSZip from "jszip";
+import type { DataWriteOptions } from "obsidian";
+import {
+  App,
+  Modal,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  requestUrl,
+  RequestUrlParam,
+  Setting,
+  normalizePath
+} from "obsidian";
+
+const DEFAULT_REMOTE_ROOT = "webdav-sync-simple";
+const METADATA_DIR = "metadata";
+const SNAPSHOTS_DIR = "snapshots";
+const BACKUPS_DIR = "backups";
+const BEFORE_DOWNLOAD_DIR = "backups/before-download";
+const MANUAL_BACKUP_DIR = "backups/manual";
+const ARCHIVE_METADATA_PATH = "__webdav_snapshot_sync_metadata__.json";
+
+const DEFAULT_IGNORE_RULES = [
+  ".git/**",
+  ".trash/**",
+  ".obsidian/workspace.json",
+  ".obsidian/workspace-mobile.json"
+];
+
+type PackageKind = "snapshot" | "backup";
+type BackupReason = "before-download" | "manual";
+
+interface SnapshotSyncSettings {
+  webdavUrl: string;
+  username: string;
+  password: string;
+  remoteRoot: string;
+  deviceId: string;
+  deviceName: string;
+  customIgnoreRules: string;
+  includeObsidianConfig: boolean;
+  retentionCount: number;
+  maxFileSizeMb: number;
+  ignoredExtensions: string;
+  lastOperationAt: string;
+  lastOperationType: string;
+}
+
+interface RemotePackageMetadata {
+  id: string;
+  kind: PackageKind;
+  backupReason?: BackupReason;
+  filename: string;
+  path: string;
+  timestamp: string;
+  deviceId: string;
+  deviceName: string;
+  pluginVersion: string;
+  vaultName: string;
+  fileCount: number;
+  sizeBytes: number;
+}
+
+interface RemoteIndex {
+  version: 1;
+  updatedAt: string;
+  snapshots: RemotePackageMetadata[];
+  backups: RemotePackageMetadata[];
+}
+
+interface LatestMetadata {
+  version: 1;
+  updatedAt: string;
+  latest: RemotePackageMetadata | null;
+}
+
+interface RemoteEntry {
+  filename: string;
+  path: string;
+  sizeBytes: number;
+  lastModified?: string;
+}
+
+interface PackageBuildResult {
+  bytes: ArrayBuffer;
+  fileCount: number;
+}
+
+interface ZipRestoreEntry {
+  path: string;
+  data: ArrayBuffer;
+  ctime?: number;
+  mtime?: number;
+}
+
+interface ArchiveFileMetadata {
+  ctime?: number;
+  mtime?: number;
+  size?: number;
+}
+
+interface ArchiveMetadata {
+  version: 1;
+  createdAt: string;
+  pluginVersion: string;
+  vaultName: string;
+  files: Record<string, ArchiveFileMetadata>;
+}
+
+const DEFAULT_SETTINGS: SnapshotSyncSettings = {
+  webdavUrl: "",
+  username: "",
+  password: "",
+  remoteRoot: DEFAULT_REMOTE_ROOT,
+  deviceId: "",
+  deviceName: "",
+  customIgnoreRules: "",
+  includeObsidianConfig: false,
+  retentionCount: 10,
+  maxFileSizeMb: 0,
+  ignoredExtensions: "",
+  lastOperationAt: "",
+  lastOperationType: ""
+};
+
+export default class WebdavSnapshotSyncPlugin extends Plugin {
+  settings: SnapshotSyncSettings;
+
+  async onload() {
+    await this.loadSettings();
+    await this.ensureDeviceIdentity();
+
+    this.addRibbonIcon("upload-cloud", "上传 WebDAV 快照", () => {
+      void this.runAction(() => this.uploadCurrentSnapshot());
+    });
+
+    this.addCommand({
+      id: "upload-current-snapshot",
+      name: "上传当前工作区快照",
+      callback: () => void this.runAction(() => this.uploadCurrentSnapshot())
+    });
+
+    this.addCommand({
+      id: "view-remote-snapshots",
+      name: "查看远端快照",
+      callback: () => void this.runAction(() => this.openRemotePackagesModal("snapshot"))
+    });
+
+    this.addCommand({
+      id: "view-remote-backups",
+      name: "查看远端备份",
+      callback: () => void this.runAction(() => this.openRemotePackagesModal("backup"))
+    });
+
+    this.addCommand({
+      id: "backup-local-vault",
+      name: "只备份本地工作区",
+      callback: () => void this.runAction(() => this.createAndUploadBackup("manual"))
+    });
+
+    this.addCommand({
+      id: "show-sync-choices",
+      name: "显示同步选择",
+      callback: () => void this.runAction(() => this.openSyncChoiceModal())
+    });
+
+    this.addSettingTab(new SnapshotSyncSettingTab(this.app, this));
+  }
+
+  onunload() {
+    // Obsidian disposes registered commands and setting tabs automatically.
+  }
+
+  async runAction(action: () => Promise<unknown>) {
+    try {
+      await action();
+    } catch (error) {
+      new Notice(errorMessage(error), 12000);
+    }
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+
+  async ensureDeviceIdentity() {
+    let changed = false;
+    if (!this.settings.deviceId) {
+      this.settings.deviceId = createDeviceId();
+      changed = true;
+    }
+
+    if (!this.settings.deviceName) {
+      this.settings.deviceName = `Device ${this.settings.deviceId.slice(0, 8)}`;
+      changed = true;
+    }
+
+    if (changed) {
+      await this.saveSettings();
+    }
+  }
+
+  async testConnection() {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+    await client.propfind("", 0);
+    new Notice("WebDAV 连接成功");
+  }
+
+  async uploadCurrentSnapshot() {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+
+    const started = new Date();
+    const filename = `${timestampForFile(started)}-${safeName(this.settings.deviceId)}.zip`;
+    const remotePath = `${SNAPSHOTS_DIR}/${filename}`;
+
+    new Notice("正在打包当前 vault...");
+    const packageResult = await this.buildZipPackage();
+
+    const metadata = this.createPackageMetadata({
+      kind: "snapshot",
+      filename,
+      remotePath,
+      timestamp: started.toISOString(),
+      fileCount: packageResult.fileCount,
+      sizeBytes: packageResult.bytes.byteLength
+    });
+
+    new Notice("正在上传快照...");
+    await client.putBytes(remotePath, packageResult.bytes);
+    await this.updateRemoteMetadata(client, metadata);
+    await this.markOperation("upload");
+
+    new Notice(
+      [
+        "快照上传成功",
+        `时间: ${formatDateTime(metadata.timestamp)}`,
+        `设备: ${metadata.deviceId}`,
+        `文件: ${metadata.fileCount}`,
+        `大小: ${formatBytes(metadata.sizeBytes)}`
+      ].join("\n"),
+      10000
+    );
+  }
+
+  async createAndUploadBackup(reason: BackupReason): Promise<RemotePackageMetadata> {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+
+    const started = new Date();
+    const prefix = reason === "before-download" ? "before-download" : "manual";
+    const folder = reason === "before-download" ? BEFORE_DOWNLOAD_DIR : MANUAL_BACKUP_DIR;
+    const filename = `${prefix}-${timestampForFile(started)}-${safeName(this.settings.deviceId)}.zip`;
+    const remotePath = `${folder}/${filename}`;
+
+    new Notice(reason === "before-download" ? "恢复前正在备份本地 vault..." : "正在备份本地 vault...");
+    const packageResult = await this.buildZipPackage();
+    const metadata = this.createPackageMetadata({
+      kind: "backup",
+      backupReason: reason,
+      filename,
+      remotePath,
+      timestamp: started.toISOString(),
+      fileCount: packageResult.fileCount,
+      sizeBytes: packageResult.bytes.byteLength
+    });
+
+    await client.putBytes(remotePath, packageResult.bytes);
+    await this.updateRemoteMetadata(client, metadata);
+    await this.markOperation("backup");
+
+    new Notice(
+      [
+        reason === "before-download" ? "恢复前备份上传成功" : "本地备份上传成功",
+        `时间: ${formatDateTime(metadata.timestamp)}`,
+        `设备: ${metadata.deviceId}`,
+        `文件: ${metadata.fileCount}`,
+        `大小: ${formatBytes(metadata.sizeBytes)}`
+      ].join("\n"),
+      10000
+    );
+
+    return metadata;
+  }
+
+  async restoreRemotePackage(remotePackage: RemotePackageMetadata) {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+
+    await this.createAndUploadBackup("before-download");
+
+    new Notice("正在下载远端包...");
+    const bytes = await client.getBytes(remotePackage.path);
+
+    new Notice("正在解析远端包...");
+    const entries = await this.readRestoreEntries(bytes);
+    if (entries.length === 0) {
+      throw new Error("远端包为空，未执行恢复。");
+    }
+
+    new Notice("正在删除本地可同步文件...");
+    await this.clearLocalVaultForRestore();
+
+    new Notice(`正在恢复 ${entries.length} 个文件...`);
+    await this.writeRestoreEntries(entries);
+    await this.markOperation(remotePackage.kind === "backup" ? "restore-backup" : "download");
+
+    new Notice(
+      [
+        "恢复完成",
+        `来源: ${remotePackage.filename}`,
+        `设备: ${remotePackage.deviceId || "未知"}`,
+        `文件: ${entries.length}`
+      ].join("\n"),
+      10000
+    );
+  }
+
+  async getLatestRemoteSnapshot(): Promise<RemotePackageMetadata | null> {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+
+    const latest = await client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`);
+    if (latest?.latest) {
+      return latest.latest;
+    }
+
+    const snapshots = await this.listRemotePackages("snapshot");
+    return snapshots[0] ?? null;
+  }
+
+  async listRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+    const index = await client.getIndex();
+
+    const packages = kind === "snapshot" ? index.snapshots : index.backups;
+    const hydrated = await this.hydratePackageSizes(client, packages);
+
+    if (hydrated.length > 0) {
+      return sortPackages(hydrated);
+    }
+
+    return this.fallbackListPackages(client, kind);
+  }
+
+  async cleanupOldSnapshots() {
+    const keepCount = Math.max(1, this.settings.retentionCount || 1);
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+    const index = await client.getIndex();
+    const sorted = sortPackages(index.snapshots);
+    const toDelete = sorted.slice(keepCount);
+
+    if (toDelete.length === 0) {
+      new Notice(`没有需要清理的旧快照，当前保留 ${sorted.length} 个。`);
+      return;
+    }
+
+    for (const item of toDelete) {
+      await client.delete(item.path);
+    }
+
+    index.snapshots = sorted.slice(0, keepCount);
+    index.updatedAt = new Date().toISOString();
+    await client.putJson(`${METADATA_DIR}/index.json`, index);
+    await client.putJson(`${METADATA_DIR}/latest.json`, {
+      version: 1,
+      updatedAt: index.updatedAt,
+      latest: index.snapshots[0] ?? null
+    } satisfies LatestMetadata);
+
+    new Notice(`已清理 ${toDelete.length} 个旧快照，保留 ${index.snapshots.length} 个。`, 8000);
+  }
+
+  async openRemotePackagesModal(kind: PackageKind) {
+    new RemotePackageModal(this.app, this, kind).open();
+  }
+
+  async openSyncChoiceModal() {
+    new SyncChoiceModal(this.app, this).open();
+  }
+
+  createClient(): WebdavClient {
+    if (!this.settings.webdavUrl.trim()) {
+      throw new Error("请先填写 WebDAV 地址。");
+    }
+
+    return new WebdavClient({
+      baseUrl: this.settings.webdavUrl,
+      username: this.settings.username,
+      password: this.settings.password,
+      root: this.settings.remoteRoot || DEFAULT_REMOTE_ROOT
+    });
+  }
+
+  createPackageMetadata(input: {
+    kind: PackageKind;
+    backupReason?: BackupReason;
+    filename: string;
+    remotePath: string;
+    timestamp: string;
+    fileCount: number;
+    sizeBytes: number;
+  }): RemotePackageMetadata {
+    const id = `${input.kind}:${input.remotePath}`;
+    return {
+      id,
+      kind: input.kind,
+      backupReason: input.backupReason,
+      filename: input.filename,
+      path: input.remotePath,
+      timestamp: input.timestamp,
+      deviceId: this.settings.deviceId,
+      deviceName: this.settings.deviceName,
+      pluginVersion: this.manifest.version,
+      vaultName: this.app.vault.getName(),
+      fileCount: input.fileCount,
+      sizeBytes: input.sizeBytes
+    };
+  }
+
+  async updateRemoteMetadata(client: WebdavClient, metadata: RemotePackageMetadata) {
+    const index = await client.getIndex();
+
+    if (metadata.kind === "snapshot") {
+      index.snapshots = upsertPackage(index.snapshots, metadata);
+      index.snapshots = sortPackages(index.snapshots);
+      await client.putJson(`${METADATA_DIR}/latest.json`, {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        latest: index.snapshots[0] ?? metadata
+      } satisfies LatestMetadata);
+    } else {
+      index.backups = upsertPackage(index.backups, metadata);
+      index.backups = sortPackages(index.backups);
+    }
+
+    index.updatedAt = new Date().toISOString();
+    await client.putJson(`${METADATA_DIR}/index.json`, index);
+  }
+
+  async markOperation(operation: string) {
+    this.settings.lastOperationAt = new Date().toISOString();
+    this.settings.lastOperationType = operation;
+    await this.saveSettings();
+  }
+
+  async buildZipPackage(): Promise<PackageBuildResult> {
+    const zip = new JSZip();
+    const files = await this.collectVaultFiles();
+    const archiveMetadata: ArchiveMetadata = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      pluginVersion: this.manifest.version,
+      vaultName: this.app.vault.getName(),
+      files: {}
+    };
+
+    let fileCount = 0;
+    for (const filePath of files) {
+      const data = await this.app.vault.adapter.readBinary(filePath);
+      const stat = await this.app.vault.adapter.stat(filePath);
+      const mtime = validTimestamp(stat?.mtime) ? stat.mtime : Date.now();
+
+      zip.file(filePath, data, {
+        date: new Date(mtime)
+      });
+      archiveMetadata.files[filePath] = {
+        ctime: validTimestamp(stat?.ctime) ? stat.ctime : undefined,
+        mtime,
+        size: stat?.size ?? data.byteLength
+      };
+      fileCount += 1;
+    }
+
+    zip.file(ARCHIVE_METADATA_PATH, JSON.stringify(archiveMetadata, null, 2), {
+      date: new Date()
+    });
+
+    const bytes = await zip.generateAsync({
+      type: "arraybuffer",
+      compression: "DEFLATE",
+      compressionOptions: {
+        level: 6
+      },
+      streamFiles: true
+    });
+
+    return {
+      bytes,
+      fileCount
+    };
+  }
+
+  async collectVaultFiles(): Promise<string[]> {
+    const files: string[] = [];
+    const ignoredExtensions = parseExtensionList(this.settings.ignoredExtensions);
+
+    const walk = async (folder: string) => {
+      const listed = await this.app.vault.adapter.list(folder);
+
+      for (const filePath of listed.files) {
+        const normalized = normalizePath(filePath);
+        const stat = await this.app.vault.adapter.stat(normalized);
+
+        if (this.shouldIgnorePath(normalized, stat?.size ?? 0, ignoredExtensions)) {
+          continue;
+        }
+
+        files.push(normalized);
+      }
+
+      for (const childFolder of listed.folders) {
+        const normalized = normalizePath(childFolder);
+        if (this.shouldIgnorePath(`${normalized}/`, 0, ignoredExtensions)) {
+          continue;
+        }
+
+        await walk(normalized);
+      }
+    };
+
+    await walk("");
+    return files.sort((a, b) => a.localeCompare(b));
+  }
+
+  shouldIgnorePath(path: string, sizeBytes: number, ignoredExtensions: Set<string>): boolean {
+    const normalized = normalizePath(path).replace(/\/$/, "");
+
+    if (!this.settings.includeObsidianConfig && matchesGlob(".obsidian/**", normalized)) {
+      return true;
+    }
+
+    const pluginDirRule = `.obsidian/plugins/${this.manifest.id}/**`;
+    const rules = [
+      ...DEFAULT_IGNORE_RULES,
+      pluginDirRule,
+      ...parseRuleLines(this.settings.customIgnoreRules)
+    ];
+
+    if (rules.some((rule) => matchesGlob(rule, normalized))) {
+      return true;
+    }
+
+    if (this.settings.maxFileSizeMb > 0) {
+      const maxBytes = this.settings.maxFileSizeMb * 1024 * 1024;
+      if (sizeBytes > maxBytes) {
+        return true;
+      }
+    }
+
+    const ext = getExtension(normalized);
+    return Boolean(ext && ignoredExtensions.has(ext));
+  }
+
+  async readRestoreEntries(bytes: ArrayBuffer): Promise<ZipRestoreEntry[]> {
+    const zip = await JSZip.loadAsync(bytes);
+    const archiveMetadata = await this.readArchiveMetadata(zip);
+    const entries: ZipRestoreEntry[] = [];
+    const files = Object.values(zip.files).filter((entry) => !entry.dir && entry.name !== ARCHIVE_METADATA_PATH);
+
+    for (const file of files) {
+      const safePath = normalizeRestorePath(file.name);
+      if (!safePath) {
+        continue;
+      }
+
+      if (matchesGlob(`.obsidian/plugins/${this.manifest.id}/**`, safePath)) {
+        continue;
+      }
+
+      const data = await file.async("arraybuffer");
+      const metadata = archiveMetadata?.files[safePath];
+      entries.push({
+        path: safePath,
+        data,
+        ctime: validTimestamp(metadata?.ctime) ? metadata.ctime : undefined,
+        mtime: validTimestamp(metadata?.mtime) ? metadata.mtime : file.date?.getTime()
+      });
+    }
+
+    return entries.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  async readArchiveMetadata(zip: JSZip): Promise<ArchiveMetadata | null> {
+    const metadataFile = zip.file(ARCHIVE_METADATA_PATH);
+    if (!metadataFile) {
+      return null;
+    }
+
+    try {
+      const text = await metadataFile.async("text");
+      const parsed = JSON.parse(text) as ArchiveMetadata;
+      if (parsed.version !== 1 || !parsed.files) {
+        return null;
+      }
+
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  async writeRestoreEntries(entries: ZipRestoreEntry[]) {
+    for (const entry of entries) {
+      await this.ensureLocalFolder(parentPath(entry.path));
+      await this.app.vault.adapter.writeBinary(entry.path, entry.data, writeOptionsForEntry(entry));
+    }
+  }
+
+  async clearLocalVaultForRestore() {
+    const files = await this.collectVaultFiles();
+
+    for (const filePath of files.sort((a, b) => b.localeCompare(a))) {
+      if (await this.app.vault.adapter.exists(filePath)) {
+        await this.app.vault.adapter.remove(filePath);
+      }
+    }
+
+    await this.removeEmptyLocalFolders("");
+  }
+
+  async removeEmptyLocalFolders(folder: string) {
+    const ignoredExtensions = parseExtensionList(this.settings.ignoredExtensions);
+    const listed = await this.app.vault.adapter.list(folder);
+
+    for (const childFolder of listed.folders.sort((a, b) => b.localeCompare(a))) {
+      const normalized = normalizePath(childFolder);
+      if (this.shouldIgnorePath(`${normalized}/`, 0, ignoredExtensions)) {
+        continue;
+      }
+
+      await this.removeEmptyLocalFolders(normalized);
+    }
+
+    if (!folder) {
+      return;
+    }
+
+    const afterCleanup = await this.app.vault.adapter.list(folder);
+    if (afterCleanup.files.length === 0 && afterCleanup.folders.length === 0) {
+      await this.app.vault.adapter.rmdir(folder, false);
+    }
+  }
+
+  async ensureLocalFolder(folder: string) {
+    if (!folder) {
+      return;
+    }
+
+    const parts = normalizePath(folder).split("/").filter(Boolean);
+    let current = "";
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      if (!(await this.app.vault.adapter.exists(current))) {
+        await this.app.vault.adapter.mkdir(current);
+      }
+    }
+  }
+
+  async hydratePackageSizes(
+    client: WebdavClient,
+    packages: RemotePackageMetadata[]
+  ): Promise<RemotePackageMetadata[]> {
+    if (packages.every((item) => item.sizeBytes > 0)) {
+      return packages;
+    }
+
+    const directories = new Set<string>();
+    for (const item of packages) {
+      directories.add(parentPath(item.path));
+    }
+
+    const sizeByPath = new Map<string, number>();
+    for (const directory of directories) {
+      const entries = await client.propfind(directory, 1).catch(() => []);
+      for (const entry of entries) {
+        sizeByPath.set(entry.path, entry.sizeBytes);
+      }
+    }
+
+    return packages.map((item) => ({
+      ...item,
+      sizeBytes: item.sizeBytes || sizeByPath.get(item.path) || 0
+    }));
+  }
+
+  async fallbackListPackages(client: WebdavClient, kind: PackageKind): Promise<RemotePackageMetadata[]> {
+    const directories = kind === "snapshot" ? [SNAPSHOTS_DIR] : [BEFORE_DOWNLOAD_DIR, MANUAL_BACKUP_DIR];
+    const packages: RemotePackageMetadata[] = [];
+
+    for (const directory of directories) {
+      const entries = await client.propfind(directory, 1).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.filename.endsWith(".zip")) {
+          continue;
+        }
+
+        packages.push({
+          id: `${kind}:${entry.path}`,
+          kind,
+          backupReason: directory.includes("before-download") ? "before-download" : "manual",
+          filename: entry.filename,
+          path: entry.path,
+          timestamp: parseTimestampFromFilename(entry.filename) ?? entry.lastModified ?? "",
+          deviceId: parseDeviceIdFromFilename(entry.filename),
+          deviceName: "",
+          pluginVersion: "",
+          vaultName: "",
+          fileCount: 0,
+          sizeBytes: entry.sizeBytes
+        });
+      }
+    }
+
+    return sortPackages(packages);
+  }
+}
+
+class WebdavClient {
+  private readonly baseUrl: string;
+  private readonly root: string;
+  private readonly username: string;
+  private readonly password: string;
+
+  constructor(options: { baseUrl: string; root: string; username: string; password: string }) {
+    this.baseUrl = options.baseUrl.trim().replace(/\/+$/, "");
+    this.root = trimSlashes(options.root || DEFAULT_REMOTE_ROOT);
+    this.username = options.username;
+    this.password = options.password;
+
+    validateWebdavUrl(this.baseUrl);
+  }
+
+  async ensureBaseLayout() {
+    await this.ensureDir("");
+    await this.ensureDir(SNAPSHOTS_DIR);
+    await this.ensureDir(METADATA_DIR);
+    await this.ensureDir(BACKUPS_DIR);
+    await this.ensureDir(BEFORE_DOWNLOAD_DIR);
+    await this.ensureDir(MANUAL_BACKUP_DIR);
+  }
+
+  async ensureDir(path: string) {
+    const segments = [this.root, ...trimSlashes(path).split("/").filter(Boolean)];
+    let current = "";
+
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      const response = await this.rawRequest("MKCOL", current);
+
+      if (![200, 201, 405].includes(response.status)) {
+        throw new Error(`无法创建远端目录 ${current}: HTTP ${response.status}`);
+      }
+    }
+  }
+
+  async putBytes(path: string, bytes: ArrayBuffer) {
+    const response = await this.rawRequest("PUT", this.fullPath(path), bytes, {
+      "Content-Type": "application/zip"
+    });
+
+    if (![200, 201, 204].includes(response.status)) {
+      throw new Error(`上传失败 ${path}: HTTP ${response.status}`);
+    }
+  }
+
+  async putJson(path: string, data: unknown) {
+    const response = await this.rawRequest("PUT", this.fullPath(path), JSON.stringify(data, null, 2), {
+      "Content-Type": "application/json; charset=utf-8"
+    });
+
+    if (![200, 201, 204].includes(response.status)) {
+      throw new Error(`上传元数据失败 ${path}: HTTP ${response.status}`);
+    }
+  }
+
+  async getBytes(path: string): Promise<ArrayBuffer> {
+    const response = await this.rawRequest("GET", this.fullPath(path));
+
+    if (response.status !== 200) {
+      throw new Error(`下载失败 ${path}: HTTP ${response.status}`);
+    }
+
+    return response.arrayBuffer;
+  }
+
+  async getText(path: string): Promise<string | null> {
+    const response = await this.rawRequest("GET", this.fullPath(path));
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (response.status !== 200) {
+      throw new Error(`读取远端文件失败 ${path}: HTTP ${response.status}`);
+    }
+
+    return response.text;
+  }
+
+  async getJson<T>(path: string): Promise<T | null> {
+    const text = await this.getText(path);
+    if (!text) {
+      return null;
+    }
+
+    return JSON.parse(text) as T;
+  }
+
+  async getIndex(): Promise<RemoteIndex> {
+    const index = await this.getJson<RemoteIndex>(`${METADATA_DIR}/index.json`);
+
+    return {
+      version: 1,
+      updatedAt: index?.updatedAt ?? new Date().toISOString(),
+      snapshots: index?.snapshots ?? [],
+      backups: index?.backups ?? []
+    };
+  }
+
+  async delete(path: string) {
+    const response = await this.rawRequest("DELETE", this.fullPath(path));
+
+    if (![200, 202, 204, 404].includes(response.status)) {
+      throw new Error(`删除失败 ${path}: HTTP ${response.status}`);
+    }
+  }
+
+  async propfind(path: string, depth: 0 | 1): Promise<RemoteEntry[]> {
+    const response = await this.rawRequest(
+      "PROPFIND",
+      this.fullPath(path),
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop><getcontentlength/><getlastmodified/><resourcetype/></prop></propfind>",
+      {
+        Depth: String(depth),
+        "Content-Type": "application/xml; charset=utf-8"
+      }
+    );
+
+    if (response.status === 404) {
+      return [];
+    }
+
+    if (![207, 200].includes(response.status)) {
+      throw new Error(`读取远端目录失败 ${path}: HTTP ${response.status}`);
+    }
+
+    return parsePropfind(response.text, this.root);
+  }
+
+  private async rawRequest(
+    method: string,
+    path: string,
+    body?: string | ArrayBuffer,
+    headers: Record<string, string> = {}
+  ) {
+    const request: RequestUrlParam = {
+      url: this.urlFor(path),
+      method,
+      headers: {
+        ...this.authHeaders(),
+        ...headers
+      },
+      throw: false
+    };
+
+    if (body !== undefined) {
+      request.body = body;
+    }
+
+    return requestUrl(request);
+  }
+
+  private fullPath(path: string): string {
+    return trimSlashes([this.root, trimSlashes(path)].filter(Boolean).join("/"));
+  }
+
+  private urlFor(path: string): string {
+    const encodedPath = trimSlashes(path)
+      .split("/")
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join("/");
+
+    return encodedPath ? `${this.baseUrl}/${encodedPath}` : this.baseUrl;
+  }
+
+  private authHeaders(): Record<string, string> {
+    if (!this.username && !this.password) {
+      return {};
+    }
+
+    return {
+      Authorization: `Basic ${base64Utf8(`${this.username}:${this.password}`)}`
+    };
+  }
+}
+
+class RemotePackageModal extends Modal {
+  constructor(
+    app: App,
+    private readonly plugin: WebdavSnapshotSyncPlugin,
+    private readonly kind: PackageKind
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.renderLoading();
+    void this.load();
+  }
+
+  async load() {
+    try {
+      const packages = await this.plugin.listRemotePackages(this.kind);
+      this.render(packages);
+    } catch (error) {
+      this.renderError(error);
+    }
+  }
+
+  renderLoading() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: this.kind === "snapshot" ? "远端快照" : "远端备份"
+    });
+    contentEl.createEl("p", {
+      text: "正在读取..."
+    });
+  }
+
+  render(packages: RemotePackageMetadata[]) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: this.kind === "snapshot" ? "远端快照" : "远端备份"
+    });
+
+    if (packages.length === 0) {
+      contentEl.createEl("p", {
+        text: "没有找到远端包。"
+      });
+      return;
+    }
+
+    for (const item of packages) {
+      const block = contentEl.createDiv({
+        cls: "webdav-snapshot-sync-item"
+      });
+      block.createEl("h3", {
+        text: item.filename
+      });
+      block.createEl("p", {
+        text: [
+          `时间: ${formatDateTime(item.timestamp)}`,
+          `设备 ID: ${item.deviceId || "未知"}`,
+          `设备名称: ${item.deviceName || "未知"}`,
+          `大小: ${formatBytes(item.sizeBytes)}`
+        ].join(" | ")
+      });
+
+      new Setting(block).addButton((button) => {
+        button
+          .setButtonText(this.kind === "snapshot" ? "下载并恢复" : "从备份恢复")
+          .setCta()
+          .onClick(async () => {
+            button.setDisabled(true);
+            try {
+              await this.plugin.restoreRemotePackage(item);
+              this.close();
+            } catch (error) {
+              new Notice(errorMessage(error), 12000);
+              button.setDisabled(false);
+            }
+          });
+      });
+    }
+  }
+
+  renderError(error: unknown) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: "读取失败"
+    });
+    contentEl.createEl("p", {
+      text: errorMessage(error)
+    });
+  }
+}
+
+class SyncChoiceModal extends Modal {
+  constructor(app: App, private readonly plugin: WebdavSnapshotSyncPlugin) {
+    super(app);
+  }
+
+  onOpen() {
+    this.renderLoading();
+    void this.load();
+  }
+
+  renderLoading() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: "同步选择"
+    });
+    contentEl.createEl("p", {
+      text: "正在读取远端最新快照..."
+    });
+  }
+
+  async load() {
+    try {
+      const latest = await this.plugin.getLatestRemoteSnapshot();
+      this.render(latest);
+    } catch (error) {
+      this.renderError(error);
+    }
+  }
+
+  render(latest: RemotePackageMetadata | null) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: "同步选择"
+    });
+
+    const status = contentEl.createEl("pre");
+    status.setText(
+      [
+        `本地设备 ID: ${this.plugin.settings.deviceId}`,
+        `远端最新设备 ID: ${latest?.deviceId ?? "无"}`,
+        `远端最新时间戳: ${latest ? formatDateTime(latest.timestamp) : "无"}`,
+        `本地上次操作时间: ${this.plugin.settings.lastOperationAt ? formatDateTime(this.plugin.settings.lastOperationAt) : "无"}`,
+        `本地上次操作类型: ${this.plugin.settings.lastOperationType || "无"}`
+      ].join("\n")
+    );
+
+    const actions = new Setting(contentEl);
+    actions.addButton((button) => {
+      button.setButtonText("上传本地").setCta().onClick(async () => {
+        button.setDisabled(true);
+        try {
+          await this.plugin.uploadCurrentSnapshot();
+          this.close();
+        } catch (error) {
+          new Notice(errorMessage(error), 12000);
+          button.setDisabled(false);
+        }
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("下载远端").onClick(async () => {
+        if (!latest) {
+          new Notice("远端没有可下载的快照。");
+          return;
+        }
+
+        button.setDisabled(true);
+        try {
+          await this.plugin.restoreRemotePackage(latest);
+          this.close();
+        } catch (error) {
+          new Notice(errorMessage(error), 12000);
+          button.setDisabled(false);
+        }
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("只备份本地").onClick(async () => {
+        button.setDisabled(true);
+        try {
+          await this.plugin.createAndUploadBackup("manual");
+          this.close();
+        } catch (error) {
+          new Notice(errorMessage(error), 12000);
+          button.setDisabled(false);
+        }
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("什么都不做").onClick(() => this.close());
+    });
+  }
+
+  renderError(error: unknown) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", {
+      text: "读取失败"
+    });
+    contentEl.createEl("p", {
+      text: errorMessage(error)
+    });
+  }
+}
+
+class SnapshotSyncSettingTab extends PluginSettingTab {
+  constructor(app: App, private readonly plugin: WebdavSnapshotSyncPlugin) {
+    super(app, plugin);
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    containerEl.createEl("h2", {
+      text: "WebDAV Snapshot Sync"
+    });
+
+    new Setting(containerEl)
+      .setName("插件版本")
+      .setDesc(this.plugin.manifest.version);
+
+    new Setting(containerEl)
+      .setName("设备 ID")
+      .setDesc(this.plugin.settings.deviceId);
+
+    new Setting(containerEl)
+      .setName("设备名称")
+      .addText((text) =>
+        text
+          .setPlaceholder("Laptop")
+          .setValue(this.plugin.settings.deviceName)
+          .onChange(async (value) => {
+            this.plugin.settings.deviceName = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("WebDAV 地址")
+      .addText((text) =>
+        text
+          .setPlaceholder("https://example.com/dav")
+          .setValue(this.plugin.settings.webdavUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.webdavUrl = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("用户名")
+      .addText((text) =>
+        text
+          .setValue(this.plugin.settings.username)
+          .onChange(async (value) => {
+            this.plugin.settings.username = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("密码或令牌")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setValue(this.plugin.settings.password)
+          .onChange(async (value) => {
+            this.plugin.settings.password = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("远端根目录")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_REMOTE_ROOT)
+          .setValue(this.plugin.settings.remoteRoot)
+          .onChange(async (value) => {
+            this.plugin.settings.remoteRoot = value.trim() || DEFAULT_REMOTE_ROOT;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("包含 .obsidian 配置")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.includeObsidianConfig)
+          .onChange(async (value) => {
+            this.plugin.settings.includeObsidianConfig = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("压缩包保留数量")
+      .addText((text) =>
+        text
+          .setPlaceholder("10")
+          .setValue(String(this.plugin.settings.retentionCount))
+          .onChange(async (value) => {
+            const parsed = Number.parseInt(value, 10);
+            this.plugin.settings.retentionCount = Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("忽略大文件")
+      .setDesc("单位 MB，0 表示不限制。")
+      .addText((text) =>
+        text
+          .setPlaceholder("0")
+          .setValue(String(this.plugin.settings.maxFileSizeMb))
+          .onChange(async (value) => {
+            const parsed = Number.parseFloat(value);
+            this.plugin.settings.maxFileSizeMb = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("忽略扩展名")
+      .setDesc("逗号、空格或换行分隔，例如 mp4, psd。")
+      .addTextArea((text) =>
+        text
+          .setValue(this.plugin.settings.ignoredExtensions)
+          .onChange(async (value) => {
+            this.plugin.settings.ignoredExtensions = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("自定义忽略规则")
+      .setDesc("每行一个 glob。默认会忽略 .git、.trash、workspace 文件和本插件目录。")
+      .addTextArea((text) => {
+        text.inputEl.rows = 8;
+        text
+          .setPlaceholder("assets/raw/**")
+          .setValue(this.plugin.settings.customIgnoreRules)
+          .onChange(async (value) => {
+            this.plugin.settings.customIgnoreRules = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    containerEl.createEl("h3", {
+      text: "操作"
+    });
+
+    new Setting(containerEl)
+      .setName("测试 WebDAV 连接")
+      .addButton((button) =>
+        button.setButtonText("测试").onClick(async () => {
+          await runWithNotice(button, () => this.plugin.testConnection());
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("上传当前快照")
+      .addButton((button) =>
+        button.setButtonText("上传").setCta().onClick(async () => {
+          await runWithNotice(button, () => this.plugin.uploadCurrentSnapshot());
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("查看远端快照")
+      .addButton((button) =>
+        button.setButtonText("查看").onClick(() => {
+          void this.plugin.openRemotePackagesModal("snapshot");
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("查看远端备份")
+      .addButton((button) =>
+        button.setButtonText("查看").onClick(() => {
+          void this.plugin.openRemotePackagesModal("backup");
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("只备份本地")
+      .addButton((button) =>
+        button.setButtonText("备份").onClick(async () => {
+          await runWithNotice(button, () => this.plugin.createAndUploadBackup("manual"));
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("同步选择")
+      .addButton((button) =>
+        button.setButtonText("打开").onClick(() => {
+          void this.plugin.openSyncChoiceModal();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("清理旧快照")
+      .addButton((button) =>
+        button.setButtonText("清理").onClick(async () => {
+          if (!window.confirm(`确定清理旧快照？将只保留最新 ${this.plugin.settings.retentionCount} 个快照。`)) {
+            return;
+          }
+
+          await runWithNotice(button, () => this.plugin.cleanupOldSnapshots());
+        })
+      );
+  }
+}
+
+async function runWithNotice(button: { setDisabled(value: boolean): unknown }, action: () => Promise<unknown>) {
+  button.setDisabled(true);
+  try {
+    await action();
+  } catch (error) {
+    new Notice(errorMessage(error), 12000);
+  } finally {
+    button.setDisabled(false);
+  }
+}
+
+function createDeviceId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+
+  return `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function timestampForFile(date: Date): string {
+  return date.toISOString().replace(/:/g, "-").replace(/\.\d{3}Z$/, "Z");
+}
+
+function safeName(value: string): string {
+  return value.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "device";
+}
+
+function base64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary);
+}
+
+function trimSlashes(value: string): string {
+  return value.replace(/^\/+|\/+$/g, "");
+}
+
+function validateWebdavUrl(value: string) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("WebDAV 地址无效，需要填写完整的 http:// 或 https:// 地址。");
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("WebDAV 地址只支持 http:// 或 https://。");
+  }
+}
+
+function parseRuleLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+}
+
+function parseExtensionList(value: string): Set<string> {
+  return new Set(
+    value
+      .split(/[\s,;]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+      .map((item) => (item.startsWith(".") ? item : `.${item}`))
+  );
+}
+
+function getExtension(path: string): string {
+  const filename = path.split("/").pop() ?? "";
+  const dot = filename.lastIndexOf(".");
+  return dot > 0 ? filename.slice(dot).toLowerCase() : "";
+}
+
+function writeOptionsForEntry(entry: ZipRestoreEntry): DataWriteOptions | undefined {
+  const options: DataWriteOptions = {};
+
+  if (validTimestamp(entry.ctime)) {
+    options.ctime = entry.ctime;
+  }
+
+  if (validTimestamp(entry.mtime)) {
+    options.mtime = entry.mtime;
+  }
+
+  return options.ctime || options.mtime ? options : undefined;
+}
+
+function validTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function matchesGlob(pattern: string, path: string): boolean {
+  const normalizedPattern = normalizePath(pattern.trim()).replace(/^\/+/, "").replace(/\/$/, "");
+  const normalizedPath = normalizePath(path).replace(/^\/+/, "").replace(/\/$/, "");
+
+  if (!normalizedPattern) {
+    return false;
+  }
+
+  if (normalizedPattern.endsWith("/**")) {
+    const prefix = normalizedPattern.slice(0, -3);
+    return normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`);
+  }
+
+  if (!normalizedPattern.includes("*")) {
+    return normalizedPath === normalizedPattern;
+  }
+
+  const regex = globToRegExp(normalizedPattern);
+  return regex.test(normalizedPath);
+}
+
+function globToRegExp(pattern: string): RegExp {
+  let source = "^";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const char = pattern[i];
+    const next = pattern[i + 1];
+
+    if (char === "*" && next === "*") {
+      source += ".*";
+      i += 1;
+    } else if (char === "*") {
+      source += "[^/]*";
+    } else {
+      source += escapeRegExp(char);
+    }
+  }
+
+  source += "$";
+  return new RegExp(source);
+}
+
+function escapeRegExp(char: string): string {
+  return /[\\^$+?.()|[\]{}]/.test(char) ? `\\${char}` : char;
+}
+
+function parentPath(path: string): string {
+  const normalized = normalizePath(path);
+  const index = normalized.lastIndexOf("/");
+  return index === -1 ? "" : normalized.slice(0, index);
+}
+
+function normalizeRestorePath(path: string): string | null {
+  const raw = path.replace(/\\/g, "/");
+  if (raw.startsWith("/") || /^[a-zA-Z]:\//.test(raw)) {
+    return null;
+  }
+
+  const normalized = normalizePath(raw);
+  if (!normalized || normalized === "." || normalized.includes("../") || normalized === "..") {
+    return null;
+  }
+
+  return normalized;
+}
+
+function upsertPackage(items: RemotePackageMetadata[], item: RemotePackageMetadata): RemotePackageMetadata[] {
+  const withoutExisting = items.filter((existing) => existing.path !== item.path);
+  return [item, ...withoutExisting];
+}
+
+function sortPackages(items: RemotePackageMetadata[]): RemotePackageMetadata[] {
+  return [...items].sort((a, b) => {
+    const bTime = Date.parse(b.timestamp) || 0;
+    const aTime = Date.parse(a.timestamp) || 0;
+    return bTime - aTime || b.filename.localeCompare(a.filename);
+  });
+}
+
+function formatDateTime(value: string): string {
+  if (!value) {
+    return "未知";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleString();
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) {
+    return "未知";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let size = bytes;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+}
+
+function parseTimestampFromFilename(filename: string): string | null {
+  const match = filename.match(/(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?)/);
+  if (!match) {
+    return null;
+  }
+
+  const raw = match[1];
+  const iso = raw.replace(/T(\d{2})-(\d{2})-(\d{2})Z?$/, "T$1:$2:$3Z");
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? raw : date.toISOString();
+}
+
+function parseDeviceIdFromFilename(filename: string): string {
+  const withoutExtension = filename.replace(/\.zip$/i, "");
+  const timestampMatch = withoutExtension.match(/(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?)-(.+)$/);
+  if (!timestampMatch) {
+    return "";
+  }
+
+  return timestampMatch[2].replace(/^before-download-/, "").replace(/^manual-/, "");
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+function parsePropfind(xml: string, root: string): RemoteEntry[] {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, "application/xml");
+  const responses = Array.from(doc.getElementsByTagNameNS("*", "response"));
+  const rootPrefix = `/${trimSlashes(root)}/`;
+  const entries: RemoteEntry[] = [];
+
+  for (const response of responses) {
+    const href = getXmlText(response, "href");
+    if (!href) {
+      continue;
+    }
+
+    const decodedPath = decodeWebdavPath(href);
+    const relative = relativeToRoot(decodedPath, rootPrefix);
+    if (!relative) {
+      continue;
+    }
+
+    const filename = relative.split("/").filter(Boolean).pop() ?? "";
+    if (!filename) {
+      continue;
+    }
+
+    if (hasXmlElement(response, "collection")) {
+      continue;
+    }
+
+    entries.push({
+      filename,
+      path: relative,
+      sizeBytes: Number.parseInt(getXmlText(response, "getcontentlength"), 10) || 0,
+      lastModified: getXmlText(response, "getlastmodified")
+    });
+  }
+
+  return entries;
+}
+
+function getXmlText(element: Element, localName: string): string {
+  const found = element.getElementsByTagNameNS("*", localName)[0];
+  return found?.textContent?.trim() ?? "";
+}
+
+function hasXmlElement(element: Element, localName: string): boolean {
+  return element.getElementsByTagNameNS("*", localName).length > 0;
+}
+
+function decodeWebdavPath(href: string): string {
+  try {
+    const url = new URL(href, "http://placeholder.local");
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return decodeURIComponent(href.split("?")[0]);
+  }
+}
+
+function relativeToRoot(path: string, rootPrefix: string): string {
+  const normalized = normalizePath(path);
+  const rootIndex = normalized.indexOf(rootPrefix);
+  if (rootIndex === -1) {
+    return "";
+  }
+
+  return trimSlashes(normalized.slice(rootIndex + rootPrefix.length));
+}

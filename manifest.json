@@ -1,0 +1,10 @@
+{
+  "id": "webdav-snapshot-sync",
+  "name": "WebDAV Snapshot Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Upload and restore full-vault WebDAV snapshot packages with mandatory safety backups.",
+  "author": "",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}

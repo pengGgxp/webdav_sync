@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-webdav-snapshot-sync",
+  "version": "0.1.0",
+  "description": "A simple Obsidian WebDAV snapshot backup and restore plugin.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "webdav",
+    "snapshot",
+    "backup"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.8.7",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}
