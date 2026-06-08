@@ -1140,7 +1140,6 @@ class ConfirmModal extends Modal {
       .addButton((button) => {
         button
           .setButtonText("确认")
-          .setDestructive()
           .onClick(() => {
             this.finish(true);
           });
