@@ -1,5 +1,7 @@
 # WebDAV 快照同步
 
+WebDAV Snapshot Sync is a manual snapshot backup and restore plugin for Obsidian. It uploads full-vault zip snapshots to a user-configured WebDAV server and always creates a safety backup before restoring remote content.
+
 WebDAV 快照同步是一个用于 Obsidian 的手动快照备份和恢复插件。
 
 它不做增量同步，不做冲突合并，不自动判断覆盖方向。插件只负责把当前库打包成快照，上传或下载快照包，记录元数据，并在恢复远端内容前强制上传本地安全备份。

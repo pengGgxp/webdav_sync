@@ -1,4 +1,4 @@
-import JSZip from "jszip";
+import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from "fflate";
 import type { DataWriteOptions } from "obsidian";
 import {
   App,
@@ -22,9 +22,7 @@ const ARCHIVE_METADATA_PATH = "__webdav_snapshot_sync_metadata__.json";
 
 const DEFAULT_IGNORE_RULES = [
   ".git/**",
-  ".trash/**",
-  ".obsidian/workspace.json",
-  ".obsidian/workspace-mobile.json"
+  ".trash/**"
 ];
 
 type PackageKind = "snapshot" | "backup";
@@ -180,7 +178,11 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = (await this.loadData()) as Partial<SnapshotSyncSettings> | null;
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loaded
+    };
   }
 
   async saveSettings() {
@@ -452,7 +454,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   }
 
   async buildZipPackage(): Promise<PackageBuildResult> {
-    const zip = new JSZip();
+    const zipEntries: Zippable = {};
     const files = await this.collectVaultFiles();
     const archiveMetadata: ArchiveMetadata = {
       version: 1,
@@ -468,9 +470,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
       const stat = await this.app.vault.adapter.stat(filePath);
       const mtime = validTimestamp(stat?.mtime) ? stat.mtime : Date.now();
 
-      zip.file(filePath, data, {
-        date: new Date(mtime)
-      });
+      zipEntries[filePath] = [new Uint8Array(data), { level: 6, mtime: new Date(mtime) }];
       archiveMetadata.files[filePath] = {
         ctime: validTimestamp(stat?.ctime) ? stat.ctime : undefined,
         mtime,
@@ -479,21 +479,11 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
       fileCount += 1;
     }
 
-    zip.file(ARCHIVE_METADATA_PATH, JSON.stringify(archiveMetadata, null, 2), {
-      date: new Date()
-    });
-
-    const bytes = await zip.generateAsync({
-      type: "arraybuffer",
-      compression: "DEFLATE",
-      compressionOptions: {
-        level: 6
-      },
-      streamFiles: true
-    });
+    zipEntries[ARCHIVE_METADATA_PATH] = [strToU8(JSON.stringify(archiveMetadata, null, 2)), { level: 6, mtime: new Date() }];
+    const zipped = zipSync(zipEntries, { level: 6 });
 
     return {
-      bytes,
+      bytes: toArrayBuffer(zipped),
       fileCount
     };
   }
@@ -533,13 +523,17 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   shouldIgnorePath(path: string, sizeBytes: number, ignoredExtensions: Set<string>): boolean {
     const normalized = normalizePath(path).replace(/\/$/, "");
 
-    if (!this.settings.includeObsidianConfig && matchesGlob(".obsidian/**", normalized)) {
+    const configDir = this.app.vault.configDir;
+
+    if (!this.settings.includeObsidianConfig && matchesGlob(`${configDir}/**`, normalized)) {
       return true;
     }
 
-    const pluginDirRule = `.obsidian/plugins/${this.manifest.id}/**`;
+    const pluginDirRule = `${configDir}/plugins/${this.manifest.id}/**`;
     const rules = [
       ...DEFAULT_IGNORE_RULES,
+      `${configDir}/workspace.json`,
+      `${configDir}/workspace-mobile.json`,
       pluginDirRule,
       ...parseRuleLines(this.settings.customIgnoreRules)
     ];
@@ -560,42 +554,44 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   }
 
   async readRestoreEntries(bytes: ArrayBuffer): Promise<ZipRestoreEntry[]> {
-    const zip = await JSZip.loadAsync(bytes);
-    const archiveMetadata = await this.readArchiveMetadata(zip);
+    const zip = unzipSync(new Uint8Array(bytes));
+    const archiveMetadata = this.readArchiveMetadata(zip);
     const entries: ZipRestoreEntry[] = [];
-    const files = Object.values(zip.files).filter((entry) => !entry.dir && entry.name !== ARCHIVE_METADATA_PATH);
 
-    for (const file of files) {
-      const safePath = normalizeRestorePath(file.name);
+    for (const [rawPath, data] of Object.entries(zip)) {
+      if (rawPath === ARCHIVE_METADATA_PATH || rawPath.endsWith("/")) {
+        continue;
+      }
+
+      const safePath = normalizeRestorePath(rawPath);
       if (!safePath) {
         continue;
       }
 
-      if (matchesGlob(`.obsidian/plugins/${this.manifest.id}/**`, safePath)) {
+      if (matchesGlob(`${this.app.vault.configDir}/plugins/${this.manifest.id}/**`, safePath)) {
         continue;
       }
 
-      const data = await file.async("arraybuffer");
       const metadata = archiveMetadata?.files[safePath];
       entries.push({
         path: safePath,
-        data,
+        data: toArrayBuffer(data),
         ctime: validTimestamp(metadata?.ctime) ? metadata.ctime : undefined,
-        mtime: validTimestamp(metadata?.mtime) ? metadata.mtime : file.date?.getTime()
+        mtime: validTimestamp(metadata?.mtime) ? metadata.mtime : undefined
       });
     }
 
     return entries.sort((a, b) => a.path.localeCompare(b.path));
   }
 
-  async readArchiveMetadata(zip: JSZip): Promise<ArchiveMetadata | null> {
-    const metadataFile = zip.file(ARCHIVE_METADATA_PATH);
+  readArchiveMetadata(zip: Record<string, Uint8Array>): ArchiveMetadata | null {
+    const metadataFile = zip[ARCHIVE_METADATA_PATH];
     if (!metadataFile) {
       return null;
     }
 
     try {
-      const text = await metadataFile.async("text");
+      const text = strFromU8(metadataFile);
       const parsed = JSON.parse(text) as ArchiveMetadata;
       if (parsed.version !== 1 || !parsed.files) {
         return null;
@@ -929,9 +925,9 @@ class RemotePackageModal extends Modal {
   renderLoading() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: this.kind === "snapshot" ? "远端快照" : "远端备份"
-    });
+    new Setting(contentEl)
+      .setName(this.kind === "snapshot" ? "远端快照" : "远端备份")
+      .setHeading();
     contentEl.createEl("p", {
       text: "正在读取..."
     });
@@ -940,9 +936,9 @@ class RemotePackageModal extends Modal {
   render(packages: RemotePackageMetadata[]) {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: this.kind === "snapshot" ? "远端快照" : "远端备份"
-    });
+    new Setting(contentEl)
+      .setName(this.kind === "snapshot" ? "远端快照" : "远端备份")
+      .setHeading();
 
     if (packages.length === 0) {
       contentEl.createEl("p", {
@@ -955,9 +951,9 @@ class RemotePackageModal extends Modal {
       const block = contentEl.createDiv({
         cls: "webdav-snapshot-sync-item"
       });
-      block.createEl("h3", {
-        text: item.filename
-      });
+      new Setting(block)
+        .setName(item.filename)
+        .setHeading();
       block.createEl("p", {
         text: [
           `时间: ${formatDateTime(item.timestamp)}`,
@@ -988,9 +984,9 @@ class RemotePackageModal extends Modal {
   renderError(error: unknown) {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: "读取失败"
-    });
+    new Setting(contentEl)
+      .setName("读取失败")
+      .setHeading();
     contentEl.createEl("p", {
       text: errorMessage(error)
     });
@@ -1010,9 +1006,9 @@ class SyncChoiceModal extends Modal {
   renderLoading() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: "同步选择"
-    });
+    new Setting(contentEl)
+      .setName("同步选择")
+      .setHeading();
     contentEl.createEl("p", {
       text: "正在读取远端最新快照..."
     });
@@ -1030,9 +1026,9 @@ class SyncChoiceModal extends Modal {
   render(latest: RemotePackageMetadata | null) {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: "同步选择"
-    });
+    new Setting(contentEl)
+      .setName("同步选择")
+      .setHeading();
 
     const status = contentEl.createEl("pre");
     status.setText(
@@ -1098,12 +1094,71 @@ class SyncChoiceModal extends Modal {
   renderError(error: unknown) {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", {
-      text: "读取失败"
-    });
+    new Setting(contentEl)
+      .setName("读取失败")
+      .setHeading();
     contentEl.createEl("p", {
       text: errorMessage(error)
     });
+  }
+}
+
+class ConfirmModal extends Modal {
+  private resolve: (confirmed: boolean) => void;
+  private resolved = false;
+
+  constructor(
+    app: App,
+    private readonly title: string,
+    private readonly message: string,
+    resolve: (confirmed: boolean) => void
+  ) {
+    super(app);
+    this.resolve = resolve;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    new Setting(contentEl)
+      .setName(this.title)
+      .setHeading();
+
+    contentEl.createEl("p", {
+      text: this.message
+    });
+
+    new Setting(contentEl)
+      .addButton((button) => {
+        button
+          .setButtonText("取消")
+          .onClick(() => {
+            this.finish(false);
+          });
+      })
+      .addButton((button) => {
+        button
+          .setButtonText("确认")
+          .setWarning()
+          .onClick(() => {
+            this.finish(true);
+          });
+      });
+  }
+
+  onClose() {
+    this.finish(false);
+  }
+
+  private finish(confirmed: boolean) {
+    if (this.resolved) {
+      return;
+    }
+
+    this.resolved = true;
+    this.resolve(confirmed);
+    this.close();
   }
 }
 
@@ -1116,9 +1171,9 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", {
-      text: "WebDAV 快照同步"
-    });
+    new Setting(containerEl)
+      .setName("WebDAV 快照同步")
+      .setHeading();
 
     new Setting(containerEl)
       .setName("插件版本")
@@ -1188,7 +1243,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("包含 .obsidian 配置")
+      .setName(`包含 ${this.plugin.app.vault.configDir} 配置`)
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.includeObsidianConfig)
@@ -1251,9 +1306,9 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
           });
       });
 
-    containerEl.createEl("h3", {
-      text: "操作"
-    });
+    new Setting(containerEl)
+      .setName("操作")
+      .setHeading();
 
     new Setting(containerEl)
       .setName("测试 WebDAV 连接")
@@ -1307,7 +1362,12 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       .setName("清理旧快照")
       .addButton((button) =>
         button.setButtonText("清理").onClick(async () => {
-          if (!window.confirm(`确定清理旧快照？将只保留最新 ${this.plugin.settings.retentionCount} 个快照。`)) {
+          const confirmed = await confirmModal(
+            this.app,
+            "清理旧快照",
+            `确定清理旧快照？将只保留最新 ${this.plugin.settings.retentionCount} 个快照。`
+          );
+          if (!confirmed) {
             return;
           }
 
@@ -1326,6 +1386,12 @@ async function runWithNotice(button: { setDisabled(value: boolean): unknown }, a
   } finally {
     button.setDisabled(false);
   }
+}
+
+function confirmModal(app: App, title: string, message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    new ConfirmModal(app, title, message, resolve).open();
+  });
 }
 
 function createDeviceId(): string {
@@ -1352,6 +1418,10 @@ function base64Utf8(value: string): string {
   }
 
   return btoa(binary);
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
 function trimSlashes(value: string): string {
