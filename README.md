@@ -1,24 +1,24 @@
-# WebDAV Snapshot Sync
+# WebDAV 快照同步
 
-WebDAV Snapshot Sync is a simple Obsidian plugin for manual snapshot backup and restore over WebDAV.
+WebDAV 快照同步是一个用于 Obsidian 的手动快照备份和恢复插件。
 
-It does not do incremental sync, automatic conflict resolution, automatic merge, or automatic direction decisions. The plugin only packages the current vault, uploads or downloads snapshot archives, records metadata, and creates a safety backup before restoring remote content.
+它不做增量同步，不做冲突合并，不自动判断覆盖方向。插件只负责把当前库打包成快照，上传或下载快照包，记录元数据，并在恢复远端内容前强制上传本地安全备份。
 
-## Features
+## 功能
 
-- Configure WebDAV URL, username, password or token, remote root folder, device name, and device ID.
-- Generate a device ID on first startup.
-- Upload the current vault as a zip snapshot to `snapshots/`.
-- Update `metadata/latest.json` and `metadata/index.json` after upload.
-- Browse remote snapshots and backups manually.
-- Restore a selected remote snapshot or backup.
-- Always upload a local `before-download` backup before restoring remote content.
-- Clear local syncable files before writing restored snapshot files.
-- Preserve file `ctime` and `mtime` where supported by Obsidian's adapter.
-- Ignore `.git`, `.trash`, workspace files, this plugin's own folder, large files, selected extensions, and custom glob rules.
-- Manually clean up old snapshots according to the configured retention count.
+- 配置 WebDAV 地址、用户名、密码或令牌、远端根目录、设备名称和设备 ID。
+- 首次启动时自动生成设备 ID。
+- 手动把当前库打包为 zip 快照并上传到 `snapshots/`。
+- 上传成功后更新 `metadata/latest.json` 和 `metadata/index.json`。
+- 手动查看远端快照和远端备份。
+- 手动选择某个远端快照或备份进行恢复。
+- 恢复远端内容前，始终先上传本地 `before-download` 备份。
+- 写入远端快照内容前，会先删除本地纳入同步范围的文件。
+- 在 Obsidian 适配器支持时，恢复文件的 `ctime` 和 `mtime`。
+- 支持忽略 `.git`、`.trash`、工作区布局文件、本插件目录、大文件、指定扩展名和自定义匹配规则。
+- 支持按设置的保留数量手动清理旧快照。
 
-## Remote Layout
+## 远端结构
 
 ```text
 webdav-sync-simple/
@@ -34,54 +34,54 @@ webdav-sync-simple/
       manual-2026-06-05T14-10-00Z-device-a.zip
 ```
 
-## Safety Model
+## 安全模型
 
-Restoring remote content is intentionally manual. The plugin shows local and remote device information, but it does not decide which side is newer or safer.
+恢复远端内容必须由用户手动选择。插件会显示本地和远端设备信息，但不会判断哪一端更新，也不会自动决定上传或下载。
 
-When restoring a remote snapshot or backup, the plugin follows this order:
+恢复远端快照或备份时，插件会按下面的顺序执行：
 
-1. Package the current local vault.
-2. Upload that package to `backups/before-download/`.
-3. Download and parse the selected remote zip.
-4. Delete local files that are included in the sync scope.
-5. Write the remote zip contents into the vault.
+1. 打包当前本地库。
+2. 上传这个包到 `backups/before-download/`。
+3. 下载并解析用户选择的远端 zip。
+4. 删除本地纳入同步范围的文件。
+5. 把远端 zip 内容写入本地库。
 
-Local content is not deleted if the remote zip cannot be downloaded or parsed.
+如果远端 zip 下载失败或解析失败，本地内容不会被删除。
 
-## Privacy And Credentials
+## 隐私和凭据
 
-This plugin connects only to the WebDAV endpoint configured by the user. It reads local vault files, compresses them into zip archives, and uploads those archives to the configured WebDAV storage.
+插件只会连接用户自己配置的 WebDAV 地址。它会读取本地库文件，把这些文件压缩成 zip 包，并上传到用户配置的 WebDAV 存储。
 
-By default, `.obsidian/` is not included in snapshots. If the setting to include Obsidian configuration is enabled, most Obsidian settings and third-party plugin files can be included. This plugin's own folder is still ignored by default to avoid uploading its WebDAV credentials and to avoid overwriting the plugin while it is running.
+默认情况下，`.obsidian/` 不会被包含在快照中。如果开启“包含 .obsidian 配置”，大部分 Obsidian 设置和第三方插件文件都可能被包含。本插件自己的目录仍会默认忽略，以避免把 WebDAV 密码或令牌打包上传，也避免在插件运行时覆盖自身文件。
 
-Passwords or tokens are stored in the plugin settings data managed by Obsidian. Do not enable configuration backup unless you understand what private configuration may be included in your snapshots.
+密码或令牌会保存在 Obsidian 管理的插件设置数据中。除非你清楚哪些私密配置可能进入快照，否则不要轻易开启配置备份。
 
-## Development
+## 开发
 
 ```bash
 npm install
 npm run build
 ```
 
-For local manual installation, copy the generated `main.js` and `manifest.json` into:
+手动安装时，把生成的 `main.js` 和 `manifest.json` 放到：
 
 ```text
-<your-vault>/.obsidian/plugins/webdav-snapshot-sync/
+<你的库>/.obsidian/plugins/webdav-snapshot-sync/
 ```
 
-## Community Plugin Release
+## 社区插件发布
 
-For an Obsidian community plugin release, create a GitHub release whose tag exactly matches `manifest.json`'s `version`, for example `0.1.0`.
+发布 Obsidian 社区插件时，GitHub Release 的标签必须和 `manifest.json` 里的 `version` 完全一致，例如 `0.1.0`。
 
-Build the release assets:
+生成发布附件：
 
 ```bash
 npm run package
 ```
 
-Attach these files to the release:
+上传这些文件作为 Release 附件：
 
 - `dist/main.js`
 - `dist/manifest.json`
 
-`main.js` is a generated build artifact and is intentionally ignored in the repository source tree.
+`main.js` 是构建产物，源码仓库中会忽略它。

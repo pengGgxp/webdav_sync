@@ -1,9 +1,9 @@
 {
   "id": "webdav-snapshot-sync",
-  "name": "WebDAV Snapshot Sync",
+  "name": "WebDAV 快照同步",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Upload and restore full-vault WebDAV snapshot packages with mandatory safety backups.",
+  "description": "通过 WebDAV 手动上传和恢复整个库的快照包，恢复前会强制创建安全备份。",
   "author": "pengGgxp",
   "authorUrl": "https://github.com/pengGgxp",
   "isDesktopOnly": false

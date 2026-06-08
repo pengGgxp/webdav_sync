@@ -195,7 +195,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     }
 
     if (!this.settings.deviceName) {
-      this.settings.deviceName = `Device ${this.settings.deviceId.slice(0, 8)}`;
+      this.settings.deviceName = `设备 ${this.settings.deviceId.slice(0, 8)}`;
       changed = true;
     }
 
@@ -219,7 +219,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     const filename = `${timestampForFile(started)}-${safeName(this.settings.deviceId)}.zip`;
     const remotePath = `${SNAPSHOTS_DIR}/${filename}`;
 
-    new Notice("正在打包当前 vault...");
+    new Notice("正在打包当前库...");
     const packageResult = await this.buildZipPackage();
 
     const metadata = this.createPackageMetadata({
@@ -258,7 +258,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     const filename = `${prefix}-${timestampForFile(started)}-${safeName(this.settings.deviceId)}.zip`;
     const remotePath = `${folder}/${filename}`;
 
-    new Notice(reason === "before-download" ? "恢复前正在备份本地 vault..." : "正在备份本地 vault...");
+    new Notice(reason === "before-download" ? "恢复前正在备份本地库..." : "正在备份本地库...");
     const packageResult = await this.buildZipPackage();
     const metadata = this.createPackageMetadata({
       kind: "backup",
@@ -1117,7 +1117,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     containerEl.createEl("h2", {
-      text: "WebDAV Snapshot Sync"
+      text: "WebDAV 快照同步"
     });
 
     new Setting(containerEl)
@@ -1132,7 +1132,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       .setName("设备名称")
       .addText((text) =>
         text
-          .setPlaceholder("Laptop")
+          .setPlaceholder("笔记本电脑")
           .setValue(this.plugin.settings.deviceName)
           .onChange(async (value) => {
             this.plugin.settings.deviceName = value.trim();
@@ -1239,7 +1239,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("自定义忽略规则")
-      .setDesc("每行一个 glob。默认会忽略 .git、.trash、workspace 文件和本插件目录。")
+      .setDesc("每行一个匹配规则。默认会忽略 .git、.trash、工作区布局文件和本插件目录。")
       .addTextArea((text) => {
         text.inputEl.rows = 8;
         text
