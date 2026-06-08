@@ -68,20 +68,3 @@ npm run build
 ```text
 <你的库>/.obsidian/plugins/webdav-snapshot-sync/
 ```
-
-## 社区插件发布
-
-发布 Obsidian 社区插件时，GitHub Release 的标签必须和 `manifest.json` 里的 `version` 完全一致，例如 `0.1.0`。
-
-生成发布附件：
-
-```bash
-npm run package
-```
-
-上传这些文件作为 Release 附件：
-
-- `dist/main.js`
-- `dist/manifest.json`
-
-`main.js` 是构建产物，源码仓库中会忽略它。
