@@ -1,6 +1,78 @@
-# WebDAV 快照同步
+# WebDAV Snapshot Sync
 
 WebDAV Snapshot Sync is a manual snapshot backup and restore plugin for Obsidian. It uploads full-vault zip snapshots to a user-configured WebDAV server and always creates a safety backup before restoring remote content.
+
+## Overview
+
+This plugin is intentionally simple. It does not perform incremental synchronization, file-level conflict resolution, automatic merging, or automatic direction decisions. The user chooses whether to upload local content, download a remote snapshot, restore a backup, or do nothing.
+
+Before restoring any remote snapshot or backup, the plugin first packages the current local vault and uploads that package to the configured WebDAV server under `backups/before-download/`. Local files are only deleted after the backup succeeds and the selected remote zip has been downloaded and parsed.
+
+## Features
+
+- Configure WebDAV URL, username, password or token, remote root directory, device name, and device ID.
+- Generate a device ID on first startup.
+- Manually upload the current vault as a zip snapshot to `snapshots/`.
+- Update `metadata/latest.json` and `metadata/index.json` after successful uploads.
+- View remote snapshots and remote backups.
+- Restore a user-selected remote snapshot or backup.
+- Always create and upload a local safety backup before restoring remote content.
+- Preserve `ctime` and `mtime` when the Obsidian vault adapter supports these metadata fields.
+- Ignore Git data, trash, workspace layout files, this plugin's own directory, large files, selected extensions, and custom glob-like rules.
+- Manually clean up old snapshots according to the configured retention count.
+
+## Remote Layout
+
+```text
+webdav-sync-simple/
+  snapshots/
+    2026-06-05T12-30-00Z-device-a.zip
+  metadata/
+    latest.json
+    index.json
+  backups/
+    before-download/
+      before-download-2026-06-05T14-00-00Z-device-a.zip
+    manual/
+      manual-2026-06-05T14-10-00Z-device-a.zip
+```
+
+## Safety Model
+
+Restoring remote content is always a manual action. The plugin can show local and remote device information, but it does not decide which side is newer and does not automatically choose an overwrite direction.
+
+When restoring a remote snapshot or backup, the plugin runs this sequence:
+
+1. Package the current local vault.
+2. Upload that package to `backups/before-download/`.
+3. Download and parse the selected remote zip.
+4. Delete local files that are inside the sync scope.
+5. Write the remote zip contents into the local vault.
+
+If downloading or parsing the remote zip fails, local content is not deleted.
+
+## Privacy
+
+The plugin only connects to the WebDAV endpoint configured by the user. It reads local vault files, packages them into zip archives, and uploads those archives to the configured WebDAV storage.
+
+By default, Obsidian's configuration folder is excluded from snapshots. If configuration backup is enabled, Obsidian settings and third-party plugin files may be included. This plugin's own directory is still ignored to avoid uploading WebDAV credentials and to avoid overwriting itself while running.
+
+Passwords or tokens are stored in Obsidian's plugin settings data. Do not enable configuration backup unless you understand which private configuration files may be included.
+
+## Development
+
+```bash
+npm install
+npm run build
+```
+
+For manual installation, place the generated `main.js` and `manifest.json` into:
+
+```text
+<your-vault>/.obsidian/plugins/webdav-snapshot-sync/
+```
+
+## Chinese
 
 WebDAV 快照同步是一个用于 Obsidian 的手动快照备份和恢复插件。
 

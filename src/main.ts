@@ -480,7 +480,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     }
 
     zipEntries[ARCHIVE_METADATA_PATH] = [strToU8(JSON.stringify(archiveMetadata, null, 2)), { level: 6, mtime: new Date() }];
-    const zipped = zipSync(zipEntries, { level: 6 });
+    const zipped: Uint8Array = zipSync(zipEntries, { level: 6 });
 
     return {
       bytes: toArrayBuffer(zipped),
@@ -1140,7 +1140,7 @@ class ConfirmModal extends Modal {
       .addButton((button) => {
         button
           .setButtonText("确认")
-          .setWarning()
+          .setDestructive()
           .onClick(() => {
             this.finish(true);
           });
@@ -1421,7 +1421,9 @@ function base64Utf8(value: string): string {
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 function trimSlashes(value: string): string {
