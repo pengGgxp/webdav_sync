@@ -1,20 +1,24 @@
 # WebDAV Snapshot Sync
 
-一个极简 Obsidian WebDAV 快照同步插件：不做增量同步、不做冲突合并、不自动判断覆盖方向，只负责把当前 vault 打包上传、记录元数据，并在恢复远端包之前强制上传本地安全备份。
+WebDAV Snapshot Sync is a simple Obsidian plugin for manual snapshot backup and restore over WebDAV.
 
-## 功能
+It does not do incremental sync, automatic conflict resolution, automatic merge, or automatic direction decisions. The plugin only packages the current vault, uploads or downloads snapshot archives, records metadata, and creates a safety backup before restoring remote content.
 
-- 设置 WebDAV 地址、用户名、密码/令牌、远端根目录、设备名称、设备 ID。
-- 首次启动自动生成设备 ID，上传时记录设备 ID、设备名称、时间戳、插件版本和 vault 名称。
-- 手动上传当前 vault 到 `snapshots/`，并更新 `metadata/latest.json` 和 `metadata/index.json`。
-- 查看远端快照和远端备份，用户手动选择一个包恢复。
-- 恢复任何远端包之前，都会先把当前本地 vault 打包上传到 `backups/before-download/`。
-- 支持手动“只备份本地”。
-- 支持默认忽略规则、自定义 glob、指定扩展名和大文件忽略。
-- 支持按设置的保留数量手动清理旧快照。
-- 快照包内包含文件元数据清单，恢复时会写回 `ctime` 和 `mtime`。
+## Features
 
-## 远端结构
+- Configure WebDAV URL, username, password or token, remote root folder, device name, and device ID.
+- Generate a device ID on first startup.
+- Upload the current vault as a zip snapshot to `snapshots/`.
+- Update `metadata/latest.json` and `metadata/index.json` after upload.
+- Browse remote snapshots and backups manually.
+- Restore a selected remote snapshot or backup.
+- Always upload a local `before-download` backup before restoring remote content.
+- Clear local syncable files before writing restored snapshot files.
+- Preserve file `ctime` and `mtime` where supported by Obsidian's adapter.
+- Ignore `.git`, `.trash`, workspace files, this plugin's own folder, large files, selected extensions, and custom glob rules.
+- Manually clean up old snapshots according to the configured retention count.
+
+## Remote Layout
 
 ```text
 webdav-sync-simple/
@@ -30,15 +34,54 @@ webdav-sync-simple/
       manual-2026-06-05T14-10-00Z-device-a.zip
 ```
 
-## 开发
+## Safety Model
+
+Restoring remote content is intentionally manual. The plugin shows local and remote device information, but it does not decide which side is newer or safer.
+
+When restoring a remote snapshot or backup, the plugin follows this order:
+
+1. Package the current local vault.
+2. Upload that package to `backups/before-download/`.
+3. Download and parse the selected remote zip.
+4. Delete local files that are included in the sync scope.
+5. Write the remote zip contents into the vault.
+
+Local content is not deleted if the remote zip cannot be downloaded or parsed.
+
+## Privacy And Credentials
+
+This plugin connects only to the WebDAV endpoint configured by the user. It reads local vault files, compresses them into zip archives, and uploads those archives to the configured WebDAV storage.
+
+By default, `.obsidian/` is not included in snapshots. If the setting to include Obsidian configuration is enabled, most Obsidian settings and third-party plugin files can be included. This plugin's own folder is still ignored by default to avoid uploading its WebDAV credentials and to avoid overwriting the plugin while it is running.
+
+Passwords or tokens are stored in the plugin settings data managed by Obsidian. Do not enable configuration backup unless you understand what private configuration may be included in your snapshots.
+
+## Development
 
 ```bash
 npm install
 npm run build
 ```
 
-构建后，把 `main.js`、`manifest.json` 复制到 vault 的 `.obsidian/plugins/webdav-snapshot-sync/` 下启用。
+For local manual installation, copy the generated `main.js` and `manifest.json` into:
 
-## 安全说明
+```text
+<your-vault>/.obsidian/plugins/webdav-snapshot-sync/
+```
 
-恢复会先把本地 vault 打包并上传到 `backups/before-download/`，再完整下载并解析远端 zip。只有远端包下载和解析成功后，插件才会删除本地纳入同步范围的文件，并写入远端包内容。默认忽略项、本插件目录和当前忽略规则排除的内容会被保留。
+## Community Plugin Release
+
+For an Obsidian community plugin release, create a GitHub release whose tag exactly matches `manifest.json`'s `version`, for example `0.1.0`.
+
+Build the release assets:
+
+```bash
+npm run package
+```
+
+Attach these files to the release:
+
+- `dist/main.js`
+- `dist/manifest.json`
+
+`main.js` is a generated build artifact and is intentionally ignored in the repository source tree.

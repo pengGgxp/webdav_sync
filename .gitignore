@@ -1,3 +1,5 @@
 node_modules
+main.js
+dist
 *.map
 .DS_Store
