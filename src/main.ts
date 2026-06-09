@@ -19,6 +19,7 @@ const BACKUPS_DIR = "backups";
 const BEFORE_DOWNLOAD_DIR = "backups/before-download";
 const MANUAL_BACKUP_DIR = "backups/manual";
 const ARCHIVE_METADATA_PATH = "__webdav_snapshot_sync_metadata__.json";
+const DEFAULT_CHUNK_SIZE_MB = 20;
 
 const DEFAULT_IGNORE_RULES = [
   ".git/**",
@@ -38,6 +39,7 @@ interface SnapshotSyncSettings {
   customIgnoreRules: string;
   includeObsidianConfig: boolean;
   retentionCount: number;
+  chunkSizeMb: number;
   maxFileSizeMb: number;
   ignoredExtensions: string;
   lastOperationAt: string;
@@ -57,6 +59,23 @@ interface RemotePackageMetadata {
   vaultName: string;
   fileCount: number;
   sizeBytes: number;
+  storage?: "single" | "chunked";
+  manifestPath?: string;
+  chunkSizeBytes?: number;
+  chunks?: RemotePackageChunk[];
+}
+
+interface RemotePackageChunk {
+  index: number;
+  path: string;
+  sizeBytes: number;
+}
+
+interface RemoteChunkManifest {
+  version: 1;
+  createdAt: string;
+  metadata: RemotePackageMetadata;
+  chunks: RemotePackageChunk[];
 }
 
 interface RemoteIndex {
@@ -115,6 +134,7 @@ const DEFAULT_SETTINGS: SnapshotSyncSettings = {
   customIgnoreRules: "",
   includeObsidianConfig: false,
   retentionCount: 10,
+  chunkSizeMb: DEFAULT_CHUNK_SIZE_MB,
   maxFileSizeMb: 0,
   ignoredExtensions: "",
   lastOperationAt: "",
@@ -234,7 +254,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     });
 
     new Notice("正在上传快照...");
-    await client.putBytes(remotePath, packageResult.bytes);
+    await this.uploadPackageBytes(client, metadata, packageResult.bytes);
     await this.updateRemoteMetadata(client, metadata);
     await this.markOperation("upload");
 
@@ -272,7 +292,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
       sizeBytes: packageResult.bytes.byteLength
     });
 
-    await client.putBytes(remotePath, packageResult.bytes);
+    await this.uploadPackageBytes(client, metadata, packageResult.bytes);
     await this.updateRemoteMetadata(client, metadata);
     await this.markOperation("backup");
 
@@ -297,7 +317,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     await this.createAndUploadBackup("before-download");
 
     new Notice("正在下载远端包...");
-    const bytes = await client.getBytes(remotePackage.path);
+    const bytes = await this.downloadPackageBytes(client, remotePackage);
 
     new Notice("正在解析远端包...");
     const entries = await this.readRestoreEntries(bytes);
@@ -365,7 +385,7 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     }
 
     for (const item of toDelete) {
-      await client.delete(item.path);
+      await this.deleteRemotePackage(client, item);
     }
 
     index.snapshots = sorted.slice(0, keepCount);
@@ -425,6 +445,102 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
       fileCount: input.fileCount,
       sizeBytes: input.sizeBytes
     };
+  }
+
+  async uploadPackageBytes(client: WebdavClient, metadata: RemotePackageMetadata, bytes: ArrayBuffer) {
+    const chunkSizeBytes = this.uploadChunkSizeBytes();
+    const shouldChunk = chunkSizeBytes > 0 && bytes.byteLength > chunkSizeBytes;
+
+    if (!shouldChunk) {
+      metadata.storage = "single";
+      await client.putBytes(metadata.path, bytes, "application/zip");
+      return;
+    }
+
+    const chunkFolder = `${metadata.path}.parts`;
+    const manifestPath = `${metadata.path}.parts.json`;
+    const chunks: RemotePackageChunk[] = [];
+    const totalChunks = Math.ceil(bytes.byteLength / chunkSizeBytes);
+
+    await client.ensureDir(chunkFolder);
+    const source = new Uint8Array(bytes);
+
+    for (let index = 0; index < totalChunks; index += 1) {
+      const start = index * chunkSizeBytes;
+      const end = Math.min(start + chunkSizeBytes, source.byteLength);
+      const chunkBytes = toArrayBuffer(source.slice(start, end));
+      const chunkPath = `${chunkFolder}/part-${String(index + 1).padStart(5, "0")}.bin`;
+      new Notice(`正在上传分片 ${index + 1}/${totalChunks}...`);
+      await client.putBytes(chunkPath, chunkBytes, "application/octet-stream");
+      chunks.push({
+        index,
+        path: chunkPath,
+        sizeBytes: chunkBytes.byteLength
+      });
+    }
+
+    metadata.storage = "chunked";
+    metadata.manifestPath = manifestPath;
+    metadata.chunkSizeBytes = chunkSizeBytes;
+    metadata.chunks = chunks;
+
+    await client.putJson(manifestPath, {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      metadata,
+      chunks
+    } satisfies RemoteChunkManifest);
+  }
+
+  async downloadPackageBytes(client: WebdavClient, remotePackage: RemotePackageMetadata): Promise<ArrayBuffer> {
+    if (remotePackage.storage !== "chunked") {
+      return client.getBytes(remotePackage.path);
+    }
+
+    const manifestPath = remotePackage.manifestPath || `${remotePackage.path}.parts.json`;
+    const manifest = await client.getJson<RemoteChunkManifest>(manifestPath);
+    const chunks = manifest?.chunks ?? remotePackage.chunks ?? [];
+    if (chunks.length === 0) {
+      throw new Error(`远端分片清单为空: ${manifestPath}`);
+    }
+
+    const ordered = [...chunks].sort((a, b) => a.index - b.index);
+    const buffers: Uint8Array[] = [];
+    let totalBytes = 0;
+
+    for (const chunk of ordered) {
+      const bytes = await client.getBytes(chunk.path);
+      const chunkBytes = new Uint8Array(bytes);
+      buffers.push(chunkBytes);
+      totalBytes += chunkBytes.byteLength;
+    }
+
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const buffer of buffers) {
+      merged.set(buffer, offset);
+      offset += buffer.byteLength;
+    }
+
+    return merged.buffer;
+  }
+
+  async deleteRemotePackage(client: WebdavClient, remotePackage: RemotePackageMetadata) {
+    if (remotePackage.storage === "chunked") {
+      for (const chunk of remotePackage.chunks ?? []) {
+        await client.delete(chunk.path);
+      }
+      await client.delete(remotePackage.manifestPath || `${remotePackage.path}.parts.json`);
+      await client.delete(`${remotePackage.path}.parts`);
+      return;
+    }
+
+    await client.delete(remotePackage.path);
+  }
+
+  uploadChunkSizeBytes(): number {
+    const chunkSizeMb = Number.isFinite(this.settings.chunkSizeMb) ? this.settings.chunkSizeMb : DEFAULT_CHUNK_SIZE_MB;
+    return chunkSizeMb > 0 ? Math.floor(chunkSizeMb * 1024 * 1024) : 0;
   }
 
   async updateRemoteMetadata(client: WebdavClient, metadata: RemotePackageMetadata) {
@@ -694,6 +810,14 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     for (const directory of directories) {
       const entries = await client.propfind(directory, 1).catch(() => []);
       for (const entry of entries) {
+        if (entry.filename.endsWith(".zip.parts.json")) {
+          const manifest = await client.getJson<RemoteChunkManifest>(entry.path).catch(() => null);
+          if (manifest?.metadata) {
+            packages.push(normalizeRemotePackageMetadata(manifest.metadata));
+          }
+          continue;
+        }
+
         if (!entry.filename.endsWith(".zip")) {
           continue;
         }
@@ -757,12 +881,15 @@ class WebdavClient {
     }
   }
 
-  async putBytes(path: string, bytes: ArrayBuffer) {
+  async putBytes(path: string, bytes: ArrayBuffer, contentType = "application/zip") {
     const response = await this.rawRequest("PUT", this.fullPath(path), bytes, {
-      "Content-Type": "application/zip"
+      "Content-Type": contentType
     });
 
     if (![200, 201, 204].includes(response.status)) {
+      if (response.status === 413) {
+        throw new Error(`上传失败 ${path}: HTTP 413。服务器拒绝了这次上传大小，请在设置里调小“上传分片大小”。`);
+      }
       throw new Error(`上传失败 ${path}: HTTP ${response.status}`);
     }
   }
@@ -816,8 +943,8 @@ class WebdavClient {
     return {
       version: 1,
       updatedAt: index?.updatedAt ?? new Date().toISOString(),
-      snapshots: index?.snapshots ?? [],
-      backups: index?.backups ?? []
+      snapshots: (index?.snapshots ?? []).map(normalizeRemotePackageMetadata),
+      backups: (index?.backups ?? []).map(normalizeRemotePackageMetadata)
     };
   }
 
@@ -959,7 +1086,8 @@ class RemotePackageModal extends Modal {
           `时间: ${formatDateTime(item.timestamp)}`,
           `设备 ID: ${item.deviceId || "未知"}`,
           `设备名称: ${item.deviceName || "未知"}`,
-          `大小: ${formatBytes(item.sizeBytes)}`
+          `大小: ${formatBytes(item.sizeBytes)}`,
+          `存储: ${item.storage === "chunked" ? `分片 ${item.chunks?.length ?? 0} 个` : "单文件"}`
         ].join(" | ")
       });
 
@@ -1266,6 +1394,20 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("上传分片大小")
+      .setDesc("单位 MB。超过这个大小的快照包会分片上传，0 表示关闭分片。遇到 HTTP 413 时建议保持默认或调小。")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_CHUNK_SIZE_MB))
+          .setValue(String(this.plugin.settings.chunkSizeMb))
+          .onChange(async (value) => {
+            const parsed = Number.parseFloat(value);
+            this.plugin.settings.chunkSizeMb = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_CHUNK_SIZE_MB;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("忽略大文件")
       .setDesc("单位 MB，0 表示不限制。")
       .addText((text) =>
@@ -1548,9 +1690,20 @@ function normalizeRestorePath(path: string): string | null {
   return normalized;
 }
 
+function normalizeRemotePackageMetadata(item: RemotePackageMetadata): RemotePackageMetadata {
+  const storage = item.storage ?? "single";
+  return {
+    ...item,
+    storage,
+    manifestPath: item.manifestPath ?? (storage === "chunked" ? `${item.path}.parts.json` : undefined),
+    chunkSizeBytes: item.chunkSizeBytes,
+    chunks: item.chunks ?? []
+  };
+}
+
 function upsertPackage(items: RemotePackageMetadata[], item: RemotePackageMetadata): RemotePackageMetadata[] {
   const withoutExisting = items.filter((existing) => existing.path !== item.path);
-  return [item, ...withoutExisting];
+  return [normalizeRemotePackageMetadata(item), ...withoutExisting];
 }
 
 function sortPackages(items: RemotePackageMetadata[]): RemotePackageMetadata[] {
@@ -1575,7 +1728,7 @@ function formatDateTime(value: string): string {
 }
 
 function formatBytes(bytes: number): string {
-  if (!bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) {
     return "未知";
   }
 

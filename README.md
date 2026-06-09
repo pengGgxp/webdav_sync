@@ -17,6 +17,7 @@ Before restoring any remote snapshot or backup, the plugin first packages the cu
 - View remote snapshots and remote backups.
 - Restore a user-selected remote snapshot or backup.
 - Always create and upload a local safety backup before restoring remote content.
+- Split large snapshot archives into smaller WebDAV objects to avoid HTTP 413 upload limits.
 - Preserve `ctime` and `mtime` when the Obsidian vault adapter supports these metadata fields.
 - Ignore Git data, trash, workspace layout files, this plugin's own directory, large files, selected extensions, and custom glob-like rules.
 - Manually clean up old snapshots according to the configured retention count.
@@ -27,6 +28,10 @@ Before restoring any remote snapshot or backup, the plugin first packages the cu
 webdav-sync-simple/
   snapshots/
     2026-06-05T12-30-00Z-device-a.zip
+    2026-06-05T12-30-00Z-device-b.zip.parts.json
+    2026-06-05T12-30-00Z-device-b.zip.parts/
+      part-00001.bin
+      part-00002.bin
   metadata/
     latest.json
     index.json
@@ -50,6 +55,12 @@ When restoring a remote snapshot or backup, the plugin runs this sequence:
 5. Write the remote zip contents into the local vault.
 
 If downloading or parsing the remote zip fails, local content is not deleted.
+
+## Large Uploads
+
+Some WebDAV servers or reverse proxies reject large single-request uploads with HTTP 413. To avoid that, the plugin can split a large zip archive into smaller part files. The setting is named "上传分片大小" in the plugin settings. The default is 20 MB, and setting it to `0` disables chunked uploads.
+
+Chunked snapshots still behave like normal snapshots in the plugin. The plugin records a small `*.zip.parts.json` manifest and restores by downloading all parts and joining them in order before reading the zip.
 
 ## Privacy
 
@@ -83,6 +94,7 @@ WebDAV 快照同步是一个用于 Obsidian 的手动快照备份和恢复插件
 - 配置 WebDAV 地址、用户名、密码或令牌、远端根目录、设备名称和设备 ID。
 - 首次启动时自动生成设备 ID。
 - 手动把当前库打包为 zip 快照并上传到 `snapshots/`。
+- 大快照包会按设置分片上传，以绕过部分 WebDAV 服务的 HTTP 413 限制。
 - 上传成功后更新 `metadata/latest.json` 和 `metadata/index.json`。
 - 手动查看远端快照和远端备份。
 - 手动选择某个远端快照或备份进行恢复。
