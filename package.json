@@ -1,6 +1,6 @@
 {
   "name": "obsidian-webdav-snapshot-sync",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "一个用于 Obsidian 的简易 WebDAV 快照备份和恢复插件。",
   "main": "main.js",
   "scripts": {

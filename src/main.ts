@@ -28,6 +28,7 @@ const DEFAULT_IGNORE_RULES = [
 
 type PackageKind = "snapshot" | "backup";
 type BackupReason = "before-download" | "manual";
+type RemoteStateSection = "overview" | "snapshot" | "backup" | "sync";
 
 interface SnapshotSyncSettings {
   webdavUrl: string;
@@ -89,6 +90,12 @@ interface LatestMetadata {
   version: 1;
   updatedAt: string;
   latest: RemotePackageMetadata | null;
+}
+
+interface RemoteState {
+  snapshots: RemotePackageMetadata[];
+  backups: RemotePackageMetadata[];
+  latestSnapshot: RemotePackageMetadata | null;
 }
 
 interface RemoteEntry {
@@ -159,27 +166,15 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "view-remote-snapshots",
-      name: "查看远端快照",
-      callback: () => void this.runAction(() => this.openRemotePackagesModal("snapshot"))
-    });
-
-    this.addCommand({
-      id: "view-remote-backups",
-      name: "查看远端备份",
-      callback: () => void this.runAction(() => this.openRemotePackagesModal("backup"))
+      id: "view-remote-state",
+      name: "查看远端状态",
+      callback: () => void this.runAction(() => this.openRemoteStateModal())
     });
 
     this.addCommand({
       id: "backup-local-vault",
       name: "只备份本地工作区",
       callback: () => void this.runAction(() => this.createAndUploadBackup("manual"))
-    });
-
-    this.addCommand({
-      id: "show-sync-choices",
-      name: "显示同步选择",
-      callback: () => void this.runAction(() => this.openSyncChoiceModal())
     });
 
     this.addSettingTab(new SnapshotSyncSettingTab(this.app, this));
@@ -258,13 +253,31 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     await this.updateRemoteMetadata(client, metadata);
     await this.markOperation("upload");
 
+    let cleanupNote = "自动清理: 无需处理";
+    try {
+      const cleanupResult = await this.cleanupOldSnapshots(client);
+      if (cleanupResult.deletedCount > 0) {
+        cleanupNote = `自动清理: 已清理 ${cleanupResult.deletedCount} 个旧快照`;
+        if (cleanupResult.failedCount > 0) {
+          cleanupNote += `，${cleanupResult.failedCount} 个删除失败`;
+        }
+      } else if (cleanupResult.failedCount > 0) {
+        cleanupNote = `自动清理: 删除失败 ${cleanupResult.failedCount} 个`;
+      } else {
+        cleanupNote = "自动清理: 无需处理";
+      }
+    } catch (error) {
+      cleanupNote = `自动清理: 失败（${errorMessage(error)}）`;
+    }
+
     new Notice(
       [
         "快照上传成功",
         `时间: ${formatDateTime(metadata.timestamp)}`,
         `设备: ${metadata.deviceId}`,
         `文件: ${metadata.fileCount}`,
-        `大小: ${formatBytes(metadata.sizeBytes)}`
+        `大小: ${formatBytes(metadata.sizeBytes)}`,
+        cleanupNote
       ].join("\n"),
       10000
     );
@@ -343,81 +356,114 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
     );
   }
 
-  async getLatestRemoteSnapshot(): Promise<RemotePackageMetadata | null> {
-    const snapshots = await this.refreshRemotePackages("snapshot");
-    return snapshots[0] ?? null;
-  }
-
-  async refreshRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
-    const client = this.createClient();
-    const [index, latest] = await Promise.all([
-      client.getIndex(),
-      kind === "snapshot" ? client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`) : Promise.resolve(null)
-    ]);
-
-    const packages = kind === "snapshot" ? index.snapshots : index.backups;
-    const hydrated = await this.hydratePackageSizes(client, packages);
-    const listed = hydrated.length > 0 ? hydrated : await this.fallbackListPackages(client, kind);
-
-    if (kind === "snapshot" && latest?.latest) {
-      return sortPackages(upsertPackage(listed, latest.latest));
+  async getLatestRemoteSnapshot(state?: RemoteState): Promise<RemotePackageMetadata | null> {
+    if (state) {
+      return state.latestSnapshot;
     }
 
-    return sortPackages(listed);
+    const remoteState = await this.refreshRemoteState();
+    return remoteState.latestSnapshot;
   }
 
-  async listRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
-    return this.refreshRemotePackages(kind);
+  async refreshRemoteState(client?: WebdavClient): Promise<RemoteState> {
+    const activeClient = client ?? this.createClient();
+    const [index, latest] = await Promise.all([
+      activeClient.getIndex(),
+      activeClient.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`)
+    ]);
+
+    const [snapshots, backups] = await Promise.all([
+      this.loadRemotePackagesFromIndex(activeClient, "snapshot", index.snapshots),
+      this.loadRemotePackagesFromIndex(activeClient, "backup", index.backups)
+    ]);
+
+    const latestSnapshot = latest?.latest ? normalizeRemotePackageMetadata(latest.latest) : snapshots[0] ?? null;
+
+    return {
+      snapshots: latestSnapshot ? sortPackages(upsertPackage(snapshots, latestSnapshot)) : sortPackages(snapshots),
+      backups: sortPackages(backups),
+      latestSnapshot
+    };
   }
 
-  async resolveRemotePackage(kind: PackageKind, remotePath: string): Promise<RemotePackageMetadata | null> {
-    const packages = await this.refreshRemotePackages(kind);
+  async refreshRemotePackages(kind: PackageKind, state?: RemoteState): Promise<RemotePackageMetadata[]> {
+    const currentState = state ?? (await this.refreshRemoteState());
+    return kind === "snapshot" ? currentState.snapshots : currentState.backups;
+  }
+
+  async listRemotePackages(kind: PackageKind, state?: RemoteState): Promise<RemotePackageMetadata[]> {
+    return this.refreshRemotePackages(kind, state);
+  }
+
+  async resolveRemotePackage(
+    kind: PackageKind,
+    remotePath: string,
+    state?: RemoteState
+  ): Promise<RemotePackageMetadata | null> {
+    const packages = await this.refreshRemotePackages(kind, state);
     return packages.find((item) => item.path === remotePath) ?? null;
   }
 
-  async cleanupOldSnapshots() {
+  async loadRemotePackagesFromIndex(
+    client: WebdavClient,
+    kind: PackageKind,
+    packages: RemotePackageMetadata[]
+  ): Promise<RemotePackageMetadata[]> {
+    const hydrated = await this.hydratePackageSizes(client, packages);
+    return hydrated.length > 0 ? hydrated : await this.fallbackListPackages(client, kind);
+  }
+
+  async cleanupOldSnapshots(client?: WebdavClient): Promise<{ deletedCount: number; failedCount: number; keptCount: number }> {
+    const activeClient = client ?? this.createClient();
+    await activeClient.ensureBaseLayout();
+
+    const state = await this.refreshRemoteState(activeClient);
     const keepCount = Math.max(1, this.settings.retentionCount || 1);
-    const snapshots = await this.refreshRemotePackages("snapshot");
-    const sorted = sortPackages(snapshots);
+    const sorted = sortPackages(state.snapshots);
 
     if (sorted.length === 0) {
-      new Notice("没有找到可清理的远端快照。");
-      return;
+      return { deletedCount: 0, failedCount: 0, keptCount: 0 };
     }
 
     const toDelete = sorted.slice(keepCount);
-
     if (toDelete.length === 0) {
-      new Notice(`没有需要清理的旧快照，当前保留 ${sorted.length} 个。`);
-      return;
+      return { deletedCount: 0, failedCount: 0, keptCount: sorted.length };
     }
 
-    const client = this.createClient();
-    await client.ensureBaseLayout();
+    const failed: RemotePackageMetadata[] = [];
+    let deletedCount = 0;
 
     for (const item of toDelete) {
-      await this.deleteRemotePackage(client, item);
+      try {
+        await this.deleteRemotePackage(activeClient, item);
+        deletedCount += 1;
+      } catch {
+        failed.push(item);
+      }
     }
 
-    const index = await client.getIndex();
-    index.snapshots = sorted.slice(0, keepCount);
-    index.updatedAt = new Date().toISOString();
-    await client.putJson(`${METADATA_DIR}/index.json`, index);
-    await client.putJson(`${METADATA_DIR}/latest.json`, {
+    const kept = sorted.slice(0, keepCount);
+    const nextSnapshots = sortPackages([...kept, ...failed]);
+    const updatedAt = new Date().toISOString();
+    const index = await activeClient.getIndex();
+    index.snapshots = nextSnapshots;
+    index.updatedAt = updatedAt;
+    await activeClient.putJson(`${METADATA_DIR}/index.json`, index);
+    await activeClient.putJson(`${METADATA_DIR}/latest.json`, {
       version: 1,
-      updatedAt: index.updatedAt,
+      updatedAt,
       latest: index.snapshots[0] ?? null
     } satisfies LatestMetadata);
 
-    new Notice(`已清理 ${toDelete.length} 个旧快照，保留 ${index.snapshots.length} 个。`, 8000);
+    return {
+      deletedCount,
+      failedCount: failed.length,
+      keptCount: index.snapshots.length
+    };
   }
 
-  async openRemotePackagesModal(kind: PackageKind) {
-    new RemotePackageModal(this.app, this, kind).open();
-  }
-
-  async openSyncChoiceModal() {
-    new SyncChoiceModal(this.app, this).open();
+  async openRemoteStateModal(section: RemoteStateSection = "overview") {
+    new RemoteStateModal(this.app, this, section).open();
   }
 
   createClient(): WebdavClient {
@@ -1038,13 +1084,17 @@ class WebdavClient {
   }
 }
 
-class RemotePackageModal extends Modal {
+class RemoteStateModal extends Modal {
+  private state: RemoteState | null = null;
+  private section: RemoteStateSection;
+
   constructor(
     app: App,
     private readonly plugin: WebdavSnapshotSyncPlugin,
-    private readonly kind: PackageKind
+    section: RemoteStateSection = "overview"
   ) {
     super(app);
+    this.section = section;
   }
 
   onOpen() {
@@ -1054,36 +1104,236 @@ class RemotePackageModal extends Modal {
 
   async load() {
     try {
-      const packages = await this.plugin.refreshRemotePackages(this.kind);
-      this.render(packages);
+      this.state = await this.plugin.refreshRemoteState();
+      this.render();
     } catch (error) {
       this.renderError(error);
     }
   }
 
-  renderLoading() {
+  private renderLoading() {
     const { contentEl } = this;
     contentEl.empty();
     new Setting(contentEl)
-      .setName(this.kind === "snapshot" ? "远端快照" : "远端备份")
+      .setName("远端状态")
       .setHeading();
     contentEl.createEl("p", {
-      text: "正在读取..."
+      text: "正在读取远端索引..."
     });
   }
 
-  render(packages: RemotePackageMetadata[]) {
+  private render() {
     const { contentEl } = this;
+    const state = this.state;
+    if (!state) {
+      this.renderLoading();
+      return;
+    }
+
     contentEl.empty();
     new Setting(contentEl)
-      .setName(this.kind === "snapshot" ? "远端快照" : "远端备份")
+      .setName("远端状态")
       .setHeading();
 
+    const switchRow = new Setting(contentEl);
+    switchRow
+      .setName("视图切换")
+      .setDesc("概览、快照、备份和同步判断都在这里。");
+
+    this.addSectionButton(switchRow, "概览", "overview");
+    this.addSectionButton(switchRow, "快照", "snapshot");
+    this.addSectionButton(switchRow, "备份", "backup");
+    this.addSectionButton(switchRow, "同步判断", "sync");
+    this.addRefreshButton(switchRow);
+
+    switch (this.section) {
+      case "snapshot":
+        this.renderSnapshotSection(contentEl, state);
+        break;
+      case "backup":
+        this.renderBackupSection(contentEl, state);
+        break;
+      case "sync":
+        this.renderSyncSection(contentEl, state);
+        break;
+      default:
+        this.renderOverviewSection(contentEl, state);
+        break;
+    }
+  }
+
+  private addSectionButton(setting: Setting, label: string, section: RemoteStateSection) {
+    setting.addButton((button) => {
+      button.setButtonText(label);
+      if (this.section === section) {
+        button.setCta();
+        button.setDisabled(true);
+        return;
+      }
+
+      button.onClick(() => {
+        this.section = section;
+        this.render();
+      });
+    });
+  }
+
+  private addRefreshButton(setting: Setting) {
+    setting.addButton((button) => {
+      button.setButtonText("刷新").onClick(async () => {
+        button.setDisabled(true);
+        try {
+          this.state = await this.plugin.refreshRemoteState();
+          this.render();
+        } catch (error) {
+          new Notice(errorMessage(error), 12000);
+          button.setDisabled(false);
+        }
+      });
+    });
+  }
+
+  private renderOverviewSection(contentEl: HTMLElement, state: RemoteState) {
+    new Setting(contentEl)
+      .setName("概览")
+      .setHeading();
+
+    contentEl.createEl("p", {
+      text: "这里看整体情况，再跳去快照、备份或同步判断。"
+    });
+
+    const summary = contentEl.createEl("pre");
+    summary.setText(
+      [
+        `远端快照数量: ${state.snapshots.length}`,
+        `远端备份数量: ${state.backups.length}`,
+        `远端最新设备 ID: ${state.latestSnapshot?.deviceId ?? "无"}`,
+        `远端最新时间戳: ${state.latestSnapshot ? formatDateTime(state.latestSnapshot.timestamp) : "无"}`,
+        `本地设备 ID: ${this.plugin.settings.deviceId}`,
+        `本地上次操作时间: ${this.plugin.settings.lastOperationAt ? formatDateTime(this.plugin.settings.lastOperationAt) : "无"}`
+      ].join("\n")
+    );
+
+    const actions = new Setting(contentEl);
+    actions
+      .setName("快捷操作")
+      .setDesc("先看概览，再决定是看快照、看备份，还是走同步判断。");
+
+    actions.addButton((button) => {
+      button.setButtonText("同步判断").setCta().onClick(() => {
+        this.section = "sync";
+        this.render();
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("快照").onClick(() => {
+        this.section = "snapshot";
+        this.render();
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("备份").onClick(() => {
+        this.section = "backup";
+        this.render();
+      });
+    });
+  }
+
+  private renderSnapshotSection(contentEl: HTMLElement, state: RemoteState) {
+    new Setting(contentEl)
+      .setName("远端快照")
+      .setHeading();
+
+    contentEl.createEl("p", {
+      text: `快照用于日常恢复点，只保留最近 ${this.plugin.settings.retentionCount} 个。`
+    });
+
+    this.renderPackageList(contentEl, state.snapshots, "snapshot", "没有找到远端快照。", "恢复此快照");
+  }
+
+  private renderBackupSection(contentEl: HTMLElement, state: RemoteState) {
+    new Setting(contentEl)
+      .setName("远端备份")
+      .setHeading();
+
+    contentEl.createEl("p", {
+      text: "备份是恢复前安全包和手动备份，不参与自动清理。"
+    });
+
+    this.renderPackageList(contentEl, state.backups, "backup", "没有找到远端备份。", "恢复此备份");
+  }
+
+  private renderSyncSection(contentEl: HTMLElement, state: RemoteState) {
+    new Setting(contentEl)
+      .setName("同步判断")
+      .setHeading();
+
+    contentEl.createEl("pre", {
+      text: [
+        `本地设备 ID: ${this.plugin.settings.deviceId}`,
+        `远端最新设备 ID: ${state.latestSnapshot?.deviceId ?? "无"}`,
+        `远端最新时间戳: ${state.latestSnapshot ? formatDateTime(state.latestSnapshot.timestamp) : "无"}`,
+        `本地上次操作时间: ${this.plugin.settings.lastOperationAt ? formatDateTime(this.plugin.settings.lastOperationAt) : "无"}`,
+        `本地上次操作类型: ${this.plugin.settings.lastOperationType || "无"}`
+      ].join("\n")
+    });
+
+    contentEl.createEl("p", {
+      text: "插件不会自动判断谁新谁旧，这里只给你决策信息。"
+    });
+
+    const actions = new Setting(contentEl);
+    actions.addButton((button) => {
+      button
+        .setButtonText("上传本地")
+        .setCta()
+        .onClick(async () => {
+          await this.runModalAction(button, async () => {
+            await this.plugin.uploadCurrentSnapshot();
+          }, true);
+        });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("下载远端").onClick(async () => {
+        await this.runModalAction(button, async () => {
+          const latest = await this.plugin.getLatestRemoteSnapshot();
+          if (!latest) {
+            throw new Error("远端没有可下载的快照。");
+          }
+
+          await this.plugin.restoreRemotePackage(latest);
+        }, true);
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("只备份本地").onClick(async () => {
+        await this.runModalAction(button, async () => {
+          await this.plugin.createAndUploadBackup("manual");
+        }, true);
+      });
+    });
+
+    actions.addButton((button) => {
+      button.setButtonText("关闭").onClick(() => this.close());
+    });
+  }
+
+  private renderPackageList(
+    contentEl: HTMLElement,
+    packages: RemotePackageMetadata[],
+    kind: PackageKind,
+    emptyText: string,
+    actionText: string
+  ) {
     const ordered = sortPackages(packages);
 
     if (ordered.length === 0) {
       contentEl.createEl("p", {
-        text: "没有找到远端包。"
+        text: emptyText
       });
       return;
     }
@@ -1092,249 +1342,94 @@ class RemotePackageModal extends Modal {
       text: `共 ${ordered.length} 个，已按时间从新到旧排序。`
     });
 
-    const actionText = this.kind === "snapshot" ? "下载并恢复" : "从备份恢复";
-
-    const renderItem = (parent: HTMLElement, item: RemotePackageMetadata, title: string, featured = false) => {
-      const block = parent.createDiv({
-        cls: featured ? "webdav-snapshot-sync-item webdav-snapshot-sync-item-featured" : "webdav-snapshot-sync-item"
-      });
-      if (featured) {
-        block.style.border = "1px solid var(--background-modifier-border)";
-        block.style.borderRadius = "8px";
-        block.style.padding = "12px";
-        block.style.background = "var(--background-secondary)";
-      }
-
-      new Setting(block)
-        .setName(title)
-        .setHeading();
-      block.createEl("p", {
-        text: `文件: ${item.filename}`
-      });
-      block.createEl("p", {
-        text: [
-          `时间: ${formatDateTime(item.timestamp)}`,
-          `设备 ID: ${item.deviceId || "未知"}`,
-          `设备名称: ${item.deviceName || "未知"}`,
-          `大小: ${formatBytes(item.sizeBytes)}`,
-          `存储: ${item.storage === "chunked" ? `分片 ${item.chunks?.length ?? 0} 个` : "单文件"}`
-        ].join(" | ")
-      });
-
-      new Setting(block).addButton((button) => {
-        button
-          .setButtonText(actionText)
-          .setCta()
-          .onClick(async () => {
-            button.setDisabled(true);
-            try {
-              const current = await this.plugin.resolveRemotePackage(this.kind, item.path);
-              if (!current) {
-                throw new Error("远端条目已变化，请重新打开列表后再试。");
-              }
-
-              await this.plugin.restoreRemotePackage(current);
-              this.close();
-            } catch (error) {
-              new Notice(errorMessage(error), 12000);
-              button.setDisabled(false);
-            }
-          });
-      });
-    };
-
-    renderItem(contentEl, ordered[0], "最新快照", true);
-
-    if (ordered.length > 1) {
-      contentEl.createEl("p", {
-        text: "下面是其余快照，继续向下滚动可以查看全部。"
-      });
-    }
-
-    for (const item of ordered.slice(1)) {
-      renderItem(contentEl, item, item.filename);
-    }
-  }
-
-  renderError(error: unknown) {
-    const { contentEl } = this;
-    contentEl.empty();
-    new Setting(contentEl)
-      .setName("读取失败")
-      .setHeading();
-    contentEl.createEl("p", {
-      text: errorMessage(error)
-    });
-  }
-}
-
-class SyncChoiceModal extends Modal {
-  constructor(app: App, private readonly plugin: WebdavSnapshotSyncPlugin) {
-    super(app);
-  }
-
-  onOpen() {
-    this.renderLoading();
-    void this.load();
-  }
-
-  renderLoading() {
-    const { contentEl } = this;
-    contentEl.empty();
-    new Setting(contentEl)
-      .setName("同步选择")
-      .setHeading();
-    contentEl.createEl("p", {
-      text: "正在读取远端最新快照..."
+    ordered.forEach((item, index) => {
+      this.renderPackageItem(contentEl, item, kind, index === 0, actionText);
     });
   }
 
-  async load() {
-    try {
-      const latest = await this.plugin.getLatestRemoteSnapshot();
-      this.render(latest);
-    } catch (error) {
-      this.renderError(error);
-    }
-  }
-
-  render(latest: RemotePackageMetadata | null) {
-    const { contentEl } = this;
-    contentEl.empty();
-    new Setting(contentEl)
-      .setName("同步选择")
-      .setHeading();
-
-    const status = contentEl.createEl("pre");
-    status.setText(
-      [
-        `本地设备 ID: ${this.plugin.settings.deviceId}`,
-        `远端最新设备 ID: ${latest?.deviceId ?? "无"}`,
-        `远端最新时间戳: ${latest ? formatDateTime(latest.timestamp) : "无"}`,
-        `本地上次操作时间: ${this.plugin.settings.lastOperationAt ? formatDateTime(this.plugin.settings.lastOperationAt) : "无"}`,
-        `本地上次操作类型: ${this.plugin.settings.lastOperationType || "无"}`
-      ].join("\n")
-    );
-
-    const actions = new Setting(contentEl);
-    actions.addButton((button) => {
-      button.setButtonText("上传本地").setCta().onClick(async () => {
-        button.setDisabled(true);
-        try {
-          await this.plugin.uploadCurrentSnapshot();
-          this.close();
-        } catch (error) {
-          new Notice(errorMessage(error), 12000);
-          button.setDisabled(false);
-        }
-      });
-    });
-
-    actions.addButton((button) => {
-      button.setButtonText("下载远端").onClick(async () => {
-        button.setDisabled(true);
-        try {
-          const currentLatest = await this.plugin.getLatestRemoteSnapshot();
-          if (!currentLatest) {
-            new Notice("远端没有可下载的快照。");
-            button.setDisabled(false);
-            return;
-          }
-
-          await this.plugin.restoreRemotePackage(currentLatest);
-          this.close();
-        } catch (error) {
-          new Notice(errorMessage(error), 12000);
-          button.setDisabled(false);
-        }
-      });
-    });
-
-    actions.addButton((button) => {
-      button.setButtonText("只备份本地").onClick(async () => {
-        button.setDisabled(true);
-        try {
-          await this.plugin.createAndUploadBackup("manual");
-          this.close();
-        } catch (error) {
-          new Notice(errorMessage(error), 12000);
-          button.setDisabled(false);
-        }
-      });
-    });
-
-    actions.addButton((button) => {
-      button.setButtonText("什么都不做").onClick(() => this.close());
-    });
-  }
-
-  renderError(error: unknown) {
-    const { contentEl } = this;
-    contentEl.empty();
-    new Setting(contentEl)
-      .setName("读取失败")
-      .setHeading();
-    contentEl.createEl("p", {
-      text: errorMessage(error)
-    });
-  }
-}
-
-class ConfirmModal extends Modal {
-  private resolve: (confirmed: boolean) => void;
-  private resolved = false;
-
-  constructor(
-    app: App,
-    private readonly title: string,
-    private readonly message: string,
-    resolve: (confirmed: boolean) => void
+  private renderPackageItem(
+    parent: HTMLElement,
+    item: RemotePackageMetadata,
+    kind: PackageKind,
+    featured: boolean,
+    actionText: string
   ) {
-    super(app);
-    this.resolve = resolve;
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-
-    new Setting(contentEl)
-      .setName(this.title)
-      .setHeading();
-
-    contentEl.createEl("p", {
-      text: this.message
+    const block = parent.createDiv({
+      cls: featured ? "webdav-snapshot-sync-item webdav-snapshot-sync-item-featured" : "webdav-snapshot-sync-item"
     });
-
-    new Setting(contentEl)
-      .addButton((button) => {
-        button
-          .setButtonText("取消")
-          .onClick(() => {
-            this.finish(false);
-          });
-      })
-      .addButton((button) => {
-        button
-          .setButtonText("确认")
-          .onClick(() => {
-            this.finish(true);
-          });
-      });
-  }
-
-  onClose() {
-    this.finish(false);
-  }
-
-  private finish(confirmed: boolean) {
-    if (this.resolved) {
-      return;
+    if (featured) {
+      block.style.border = "1px solid var(--background-modifier-border)";
+      block.style.borderRadius = "8px";
+      block.style.padding = "12px";
+      block.style.background = "var(--background-secondary)";
     }
 
-    this.resolved = true;
-    this.resolve(confirmed);
-    this.close();
+    const title = featured ? (kind === "snapshot" ? "最新快照" : "最新备份") : item.filename;
+    new Setting(block)
+      .setName(title)
+      .setHeading();
+
+    block.createEl("p", {
+      text: `文件: ${item.filename}`
+    });
+    block.createEl("p", {
+      text: [
+        `时间: ${formatDateTime(item.timestamp)}`,
+        `设备 ID: ${item.deviceId || "未知"}`,
+        `设备名称: ${item.deviceName || "未知"}`,
+        `大小: ${formatBytes(item.sizeBytes)}`,
+        `存储: ${item.storage === "chunked" ? `分片 ${item.chunks?.length ?? 0} 个` : "单文件"}`
+      ].join(" | ")
+    });
+    if (item.backupReason) {
+      block.createEl("p", {
+        text: `备份类型: ${item.backupReason === "before-download" ? "恢复前备份" : "手动备份"}`
+      });
+    }
+
+    new Setting(block).addButton((button) => {
+      button
+        .setButtonText(actionText)
+        .setCta()
+        .onClick(async () => {
+          await this.runModalAction(button, async () => {
+            const current = await this.plugin.resolveRemotePackage(kind, item.path);
+            if (!current) {
+              throw new Error("远端条目已变化，请重新打开列表后再试。");
+            }
+
+            await this.plugin.restoreRemotePackage(current);
+          }, true);
+        });
+    });
+  }
+
+  private async runModalAction(
+    button: { setDisabled(value: boolean): unknown },
+    action: () => Promise<unknown>,
+    closeOnSuccess = false
+  ) {
+    button.setDisabled(true);
+    try {
+      await action();
+      if (closeOnSuccess) {
+        this.close();
+      }
+    } catch (error) {
+      new Notice(errorMessage(error), 12000);
+      button.setDisabled(false);
+    }
+  }
+
+  renderError(error: unknown) {
+    const { contentEl } = this;
+    contentEl.empty();
+    new Setting(contentEl)
+      .setName("读取失败")
+      .setHeading();
+    contentEl.createEl("p", {
+      text: errorMessage(error)
+    });
   }
 }
 
@@ -1431,7 +1526,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("压缩包保留数量")
-      .setDesc("仅在你点击“清理旧快照”时生效，不会自动删除远端快照。")
+      .setDesc("上传快照后会自动清理旧快照，只保留最新这么多个。")
       .addText((text) =>
         text
           .setPlaceholder("10")
@@ -1498,7 +1593,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("操作")
+      .setName("快捷操作")
       .setHeading();
 
     new Setting(containerEl)
@@ -1518,18 +1613,10 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("查看远端快照")
+      .setName("远端状态")
       .addButton((button) =>
-        button.setButtonText("查看").onClick(() => {
-          void this.plugin.openRemotePackagesModal("snapshot");
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("查看远端备份")
-      .addButton((button) =>
-        button.setButtonText("查看").onClick(() => {
-          void this.plugin.openRemotePackagesModal("backup");
+        button.setButtonText("打开").onClick(() => {
+          void this.plugin.openRemoteStateModal();
         })
       );
 
@@ -1538,31 +1625,6 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("备份").onClick(async () => {
           await runWithNotice(button, () => this.plugin.createAndUploadBackup("manual"));
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("同步选择")
-      .addButton((button) =>
-        button.setButtonText("打开").onClick(() => {
-          void this.plugin.openSyncChoiceModal();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("清理旧快照")
-      .addButton((button) =>
-        button.setButtonText("清理").onClick(async () => {
-          const confirmed = await confirmModal(
-            this.app,
-            "清理旧快照",
-            `确定清理旧快照？将只保留最新 ${this.plugin.settings.retentionCount} 个快照。`
-          );
-          if (!confirmed) {
-            return;
-          }
-
-          await runWithNotice(button, () => this.plugin.cleanupOldSnapshots());
         })
       );
   }
@@ -1577,12 +1639,6 @@ async function runWithNotice(button: { setDisabled(value: boolean): unknown }, a
   } finally {
     button.setDisabled(false);
   }
-}
-
-function confirmModal(app: App, title: string, message: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    new ConfirmModal(app, title, message, resolve).open();
-  });
 }
 
 function createDeviceId(): string {

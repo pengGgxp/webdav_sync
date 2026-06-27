@@ -14,13 +14,13 @@ Before restoring any remote snapshot or backup, the plugin first packages the cu
 - Generate a device ID on first startup.
 - Manually upload the current vault as a zip snapshot to `snapshots/`.
 - Update `metadata/latest.json` and `metadata/index.json` after successful uploads.
-- View remote snapshots and remote backups.
+- View remote status, remote snapshots, and remote backups in one panel.
 - Restore a user-selected remote snapshot or backup.
 - Always create and upload a local safety backup before restoring remote content.
 - Split large snapshot archives into smaller WebDAV objects to avoid HTTP 413 upload limits.
 - Preserve `ctime` and `mtime` when the Obsidian vault adapter supports these metadata fields.
 - Ignore Git data, trash, workspace layout files, this plugin's own directory, large files, selected extensions, and custom glob-like rules.
-- Manually clean up old snapshots according to the configured retention count.
+- Automatically clean up old snapshots after snapshot uploads according to the configured retention count.
 
 ## Remote Layout
 
@@ -96,13 +96,13 @@ WebDAV 快照同步是一个用于 Obsidian 的手动快照备份和恢复插件
 - 手动把当前库打包为 zip 快照并上传到 `snapshots/`。
 - 大快照包会按设置分片上传，以绕过部分 WebDAV 服务的 HTTP 413 限制。
 - 上传成功后更新 `metadata/latest.json` 和 `metadata/index.json`。
-- 手动查看远端快照和远端备份。
+- 在一个远端状态面板里查看快照、备份和同步判断。
 - 手动选择某个远端快照或备份进行恢复。
 - 恢复远端内容前，始终先上传本地 `before-download` 备份。
 - 写入远端快照内容前，会先删除本地纳入同步范围的文件。
 - 在 Obsidian 适配器支持时，恢复文件的 `ctime` 和 `mtime`。
 - 支持忽略 `.git`、`.trash`、工作区布局文件、本插件目录、大文件、指定扩展名和自定义匹配规则。
-- 支持按设置的保留数量手动清理旧快照。
+- 上传快照后会按设置的保留数量自动清理旧快照。
 
 ## 远端结构
 
