@@ -368,10 +368,14 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
 
   async cleanupOldSnapshots() {
     const keepCount = Math.max(1, this.settings.retentionCount || 1);
-    const client = this.createClient();
-    await client.ensureBaseLayout();
-    const index = await client.getIndex();
-    const sorted = sortPackages(index.snapshots);
+    const snapshots = await this.listRemotePackages("snapshot");
+    const sorted = sortPackages(snapshots);
+
+    if (sorted.length === 0) {
+      new Notice("没有找到可清理的远端快照。");
+      return;
+    }
+
     const toDelete = sorted.slice(keepCount);
 
     if (toDelete.length === 0) {
@@ -379,10 +383,14 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
       return;
     }
 
+    const client = this.createClient();
+    await client.ensureBaseLayout();
+
     for (const item of toDelete) {
       await this.deleteRemotePackage(client, item);
     }
 
+    const index = await client.getIndex();
     index.snapshots = sorted.slice(0, keepCount);
     index.updatedAt = new Date().toISOString();
     await client.putJson(`${METADATA_DIR}/index.json`, index);
