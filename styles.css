@@ -1,0 +1,6 @@
+.webdav-snapshot-sync-item-featured {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--background-secondary);
+}

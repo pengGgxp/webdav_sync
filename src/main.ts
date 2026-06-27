@@ -1357,12 +1357,6 @@ class RemoteStateModal extends Modal {
     const block = parent.createDiv({
       cls: featured ? "webdav-snapshot-sync-item webdav-snapshot-sync-item-featured" : "webdav-snapshot-sync-item"
     });
-    if (featured) {
-      block.style.border = "1px solid var(--background-modifier-border)";
-      block.style.borderRadius = "8px";
-      block.style.padding = "12px";
-      block.style.background = "var(--background-secondary)";
-    }
 
     const title = featured ? (kind === "snapshot" ? "最新快照" : "最新备份") : item.filename;
     new Setting(block)
