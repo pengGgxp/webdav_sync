@@ -344,31 +344,40 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   }
 
   async getLatestRemoteSnapshot(): Promise<RemotePackageMetadata | null> {
-    const snapshots = await this.listRemotePackages("snapshot");
+    const snapshots = await this.refreshRemotePackages("snapshot");
     return snapshots[0] ?? null;
   }
 
-  async listRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
+  async refreshRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
     const client = this.createClient();
-    const index = await client.getIndex();
+    const [index, latest] = await Promise.all([
+      client.getIndex(),
+      kind === "snapshot" ? client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`) : Promise.resolve(null)
+    ]);
 
     const packages = kind === "snapshot" ? index.snapshots : index.backups;
     const hydrated = await this.hydratePackageSizes(client, packages);
     const listed = hydrated.length > 0 ? hydrated : await this.fallbackListPackages(client, kind);
 
-    if (kind === "snapshot") {
-      const latest = await client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`);
-      if (latest?.latest) {
-        return sortPackages(upsertPackage(listed, latest.latest));
-      }
+    if (kind === "snapshot" && latest?.latest) {
+      return sortPackages(upsertPackage(listed, latest.latest));
     }
 
     return sortPackages(listed);
   }
 
+  async listRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
+    return this.refreshRemotePackages(kind);
+  }
+
+  async resolveRemotePackage(kind: PackageKind, remotePath: string): Promise<RemotePackageMetadata | null> {
+    const packages = await this.refreshRemotePackages(kind);
+    return packages.find((item) => item.path === remotePath) ?? null;
+  }
+
   async cleanupOldSnapshots() {
     const keepCount = Math.max(1, this.settings.retentionCount || 1);
-    const snapshots = await this.listRemotePackages("snapshot");
+    const snapshots = await this.refreshRemotePackages("snapshot");
     const sorted = sortPackages(snapshots);
 
     if (sorted.length === 0) {
@@ -1045,7 +1054,7 @@ class RemotePackageModal extends Modal {
 
   async load() {
     try {
-      const packages = await this.plugin.listRemotePackages(this.kind);
+      const packages = await this.plugin.refreshRemotePackages(this.kind);
       this.render(packages);
     } catch (error) {
       this.renderError(error);
@@ -1119,7 +1128,12 @@ class RemotePackageModal extends Modal {
           .onClick(async () => {
             button.setDisabled(true);
             try {
-              await this.plugin.restoreRemotePackage(item);
+              const current = await this.plugin.resolveRemotePackage(this.kind, item.path);
+              if (!current) {
+                throw new Error("远端条目已变化，请重新打开列表后再试。");
+              }
+
+              await this.plugin.restoreRemotePackage(current);
               this.close();
             } catch (error) {
               new Notice(errorMessage(error), 12000);
@@ -1218,14 +1232,16 @@ class SyncChoiceModal extends Modal {
 
     actions.addButton((button) => {
       button.setButtonText("下载远端").onClick(async () => {
-        if (!latest) {
-          new Notice("远端没有可下载的快照。");
-          return;
-        }
-
         button.setDisabled(true);
         try {
-          await this.plugin.restoreRemotePackage(latest);
+          const currentLatest = await this.plugin.getLatestRemoteSnapshot();
+          if (!currentLatest) {
+            new Notice("远端没有可下载的快照。");
+            button.setDisabled(false);
+            return;
+          }
+
+          await this.plugin.restoreRemotePackage(currentLatest);
           this.close();
         } catch (error) {
           new Notice(errorMessage(error), 12000);
