@@ -344,31 +344,26 @@ export default class WebdavSnapshotSyncPlugin extends Plugin {
   }
 
   async getLatestRemoteSnapshot(): Promise<RemotePackageMetadata | null> {
-    const client = this.createClient();
-    await client.ensureBaseLayout();
-
-    const latest = await client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`);
-    if (latest?.latest) {
-      return latest.latest;
-    }
-
     const snapshots = await this.listRemotePackages("snapshot");
     return snapshots[0] ?? null;
   }
 
   async listRemotePackages(kind: PackageKind): Promise<RemotePackageMetadata[]> {
     const client = this.createClient();
-    await client.ensureBaseLayout();
     const index = await client.getIndex();
 
     const packages = kind === "snapshot" ? index.snapshots : index.backups;
     const hydrated = await this.hydratePackageSizes(client, packages);
+    const listed = hydrated.length > 0 ? hydrated : await this.fallbackListPackages(client, kind);
 
-    if (hydrated.length > 0) {
-      return sortPackages(hydrated);
+    if (kind === "snapshot") {
+      const latest = await client.getJson<LatestMetadata>(`${METADATA_DIR}/latest.json`);
+      if (latest?.latest) {
+        return sortPackages(upsertPackage(listed, latest.latest));
+      }
     }
 
-    return this.fallbackListPackages(client, kind);
+    return sortPackages(listed);
   }
 
   async cleanupOldSnapshots() {
@@ -1067,20 +1062,38 @@ class RemotePackageModal extends Modal {
       .setName(this.kind === "snapshot" ? "远端快照" : "远端备份")
       .setHeading();
 
-    if (packages.length === 0) {
+    const ordered = sortPackages(packages);
+
+    if (ordered.length === 0) {
       contentEl.createEl("p", {
         text: "没有找到远端包。"
       });
       return;
     }
 
-    for (const item of packages) {
-      const block = contentEl.createDiv({
-        cls: "webdav-snapshot-sync-item"
+    contentEl.createEl("p", {
+      text: `共 ${ordered.length} 个，已按时间从新到旧排序。`
+    });
+
+    const actionText = this.kind === "snapshot" ? "下载并恢复" : "从备份恢复";
+
+    const renderItem = (parent: HTMLElement, item: RemotePackageMetadata, title: string, featured = false) => {
+      const block = parent.createDiv({
+        cls: featured ? "webdav-snapshot-sync-item webdav-snapshot-sync-item-featured" : "webdav-snapshot-sync-item"
       });
+      if (featured) {
+        block.style.border = "1px solid var(--background-modifier-border)";
+        block.style.borderRadius = "8px";
+        block.style.padding = "12px";
+        block.style.background = "var(--background-secondary)";
+      }
+
       new Setting(block)
-        .setName(item.filename)
+        .setName(title)
         .setHeading();
+      block.createEl("p", {
+        text: `文件: ${item.filename}`
+      });
       block.createEl("p", {
         text: [
           `时间: ${formatDateTime(item.timestamp)}`,
@@ -1093,7 +1106,7 @@ class RemotePackageModal extends Modal {
 
       new Setting(block).addButton((button) => {
         button
-          .setButtonText(this.kind === "snapshot" ? "下载并恢复" : "从备份恢复")
+          .setButtonText(actionText)
           .setCta()
           .onClick(async () => {
             button.setDisabled(true);
@@ -1106,6 +1119,18 @@ class RemotePackageModal extends Modal {
             }
           });
       });
+    };
+
+    renderItem(contentEl, ordered[0], "最新快照", true);
+
+    if (ordered.length > 1) {
+      contentEl.createEl("p", {
+        text: "下面是其余快照，继续向下滚动可以查看全部。"
+      });
+    }
+
+    for (const item of ordered.slice(1)) {
+      renderItem(contentEl, item, item.filename);
     }
   }
 
@@ -1382,6 +1407,7 @@ class SnapshotSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("压缩包保留数量")
+      .setDesc("仅在你点击“清理旧快照”时生效，不会自动删除远端快照。")
       .addText((text) =>
         text
           .setPlaceholder("10")
